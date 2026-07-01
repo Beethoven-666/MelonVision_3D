@@ -1,0 +1,22 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime outputs
+outputs/
+
+# Model weights and generated binaries
+*.pt
+*.onnx
+*.engine
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
