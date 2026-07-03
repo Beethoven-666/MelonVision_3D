@@ -1,0 +1,12 @@
+frame_id: robot_base
+child_frame_id: camera_color_optical_frame
+
+translation_m:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+
+rotation_matrix:
+  - [1.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0]
+  - [0.0, 0.0, 1.0]

@@ -1,93 +1,194 @@
-# RealSense D455f + YOLOv8 输出目标三维坐标说明
+# Orbbec Gemini 435Le + 西瓜三维感知说明
 
-本文档配套脚本：[text/realsense_yolov8_3d.py](../text/realsense_yolov8_3d.py)。
+本文档替代旧的 RealSense 说明。项目现在按“纯 Python 视觉感知服务”组织，底层相机从 `pyrealsense2` 切换为 `pyorbbecsdk2`，主线目标是：
 
-## 功能
+```text
+Gemini 435Le 采集 RGB-D
+-> 西瓜分割
+-> mask + depth 生成局部点云
+-> PCA 估计三维中心、主轴和尺寸
+-> 估计吸盘接触点、表面法向和预抓取点
+-> 椭球体积预测
+-> FastAPI 向机械臂提供最新结果
+```
 
-脚本使用 Intel RealSense D455f 获取深度流和彩色流，用 YOLOv8 在彩色图像中检测目标，然后读取目标框中心点附近的深度值，并通过 RealSense SDK 的 `rs.rs2_deproject_pixel_to_point()` 将二维像素点转换为相机坐标系下的三维坐标。
+## 目录
 
-输出坐标单位为毫米，坐标原点为 RealSense 彩色相机光心：
-
-- `X`：相机视角下的左右方向
-- `Y`：相机视角下的上下方向
-- `Z`：目标到相机的前方深度方向
+```text
+D:\MelonVision_3D
+├── main_debug_view.py              # 调试界面：RGB、Depth、mask、中心点、抓取点、体积
+├── main_api.py                     # FastAPI 服务
+├── camera
+│   ├── orbbec_camera.py            # pyorbbecsdk 相机封装
+│   └── frame_utils.py              # Orbbec frame 转 OpenCV / numpy
+├── calibration
+│   ├── save_intrinsics.py          # 保存相机内参
+│   └── transform.py                # camera -> robot_base 坐标变换
+├── perception
+│   ├── watermelon_segmenter.py     # HSV MVP 西瓜分割
+│   ├── pointcloud_builder.py       # mask + depth -> 点云
+│   └── watermelon_pipeline.py      # 单帧感知流程
+├── geometry
+│   ├── pose_estimator.py           # PCA 姿态和尺寸
+│   └── suction_grasp.py            # 吸盘接触点和法向
+├── volume
+│   └── volume_estimator.py         # 椭球体积估计
+├── api
+│   ├── schemas.py
+│   └── server.py
+├── scripts
+│   ├── test_camera.py              # RGB-D 相机测试
+│   ├── test_orbbec_yolov8_3d.py    # 类似旧 realsense_yolov8_3d.py 的 YOLO 测试
+│   └── capture_dataset.py          # 按键保存 RGB-D 数据
+└── configs
+    ├── camera.yaml
+    └── T_base_camera.yaml
+```
 
 ## 安装依赖
-
-在项目根目录运行：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-如果 `pip install ...` 又出现 launcher 路径错误，继续使用 `python -m pip ...`，不要直接调用 `pip.exe`。
+`pyorbbecsdk2` 的导入名仍然是 `pyorbbecsdk`。
 
-## 基本运行
+## 1. 测试 Orbbec 相机
 
-使用 YOLOv8n 官方权重：
+```powershell
+python .\scripts\test_camera.py
+```
+
+只列出 SDK 能发现的设备：
+
+```powershell
+python .\scripts\test_camera.py --list-devices
+```
+
+无窗口处理一帧：
+
+```powershell
+python .\scripts\test_camera.py --no-window --max-frames 1
+```
+
+旧入口仍可用：
+
+```powershell
+python .\text\open_camera.py
+```
+
+## 2. 保存相机内参
+
+```powershell
+python .\calibration\save_intrinsics.py --output .\configs\camera_intrinsics.yaml
+```
+
+保存内容包括 RGB / Depth 内参、畸变参数和 depth 到 color 的外参。
+
+## 3. 运行调试界面
+
+```powershell
+python .\main_debug_view.py
+```
+
+窗口会显示三列画面：RGB 叠加 mask、深度伪彩色图、mask。检测到西瓜后会显示中心点、吸盘接触点、法向箭头、体积和抓取置信度。
+
+当前 MVP 使用 HSV 阈值做西瓜分割，现场需要根据光照调整 `perception/watermelon_segmenter.py` 中的阈值。
+
+## 4. 运行 API 服务
+
+```powershell
+python .\main_api.py --host 0.0.0.0 --port 8000
+```
+
+接口：
+
+```http
+GET /api/v1/system/status
+GET /api/v1/watermelon/best_target
+```
+
+机械臂主要读取：
+
+```http
+GET /api/v1/watermelon/best_target
+```
+
+返回目标坐标默认位于 `robot_base` 坐标系，单位为米。当前 `configs/T_base_camera.yaml` 是单位矩阵占位，正式抓取前必须完成相机到机械臂基坐标系的标定。
+
+## 5. 类似旧文件的 YOLO 测试程序
+
+如果你想像旧 `text/realsense_yolov8_3d.py` 一样用 YOLO 检测框中心输出三维坐标，运行：
+
+```powershell
+python .\scripts\test_orbbec_yolov8_3d.py --model yolov8n.pt
+```
+
+常用参数：
+
+```powershell
+python .\scripts\test_orbbec_yolov8_3d.py --model yolov8n.pt --conf 0.4 --interval 0.5 --csv .\outputs\coords.csv
+```
+
+无窗口测试一帧：
+
+```powershell
+python .\scripts\test_orbbec_yolov8_3d.py --model yolov8n.pt --no-window --max-frames 1
+```
+
+为了保留旧习惯，下面这个命令也会调用新的 Orbbec YOLO 测试程序：
 
 ```powershell
 python .\text\realsense_yolov8_3d.py --model yolov8n.pt
 ```
 
-第一次运行时，`ultralytics` 会自动下载 `yolov8n.pt`。如果你已经有自己训练的权重，例如 `best.pt`：
-
-```powershell
-python .\text\realsense_yolov8_3d.py --model .\weights\best.pt
-```
-
-退出窗口：按 `q` 或 `Esc`。
-
-## 常用参数
-
-```powershell
-python .\text\realsense_yolov8_3d.py --model yolov8n.pt --conf 0.4 --interval 0.5 --csv .\outputs\coords.csv
-```
-
-参数说明：
-
-- `--model`：YOLOv8 权重路径，默认 `yolov8n.pt`
-- `--conf`：检测置信度阈值，默认 `0.25`
-- `--width` / `--height` / `--fps`：RealSense 视频流参数，默认 `640x480@30fps`
-- `--interval`：检测间隔秒数，默认 `0`，表示每帧检测；机械臂抓取场景可设置为 `0.5`、`1` 或更大
-- `--depth-window`：目标中心点周围取深度的窗口大小，默认 `5`，用于避开单个像素深度空洞
-- `--classes`：只检测指定类别 ID，例如只检测 COCO 中的 person：`--classes 0`
-- `--device`：YOLO 推理设备，例如 `cpu`、`0`、`cuda:0`
-- `--csv`：保存检测结果和三维坐标到 CSV
-- `--no-window`：不显示 OpenCV 窗口，只在命令行输出结果
-- `--max-frames`：处理指定帧数后自动退出，默认 `0` 表示一直运行
-
-## 输出示例
-
-命令行会输出类似内容：
+输出格式保持接近旧版：
 
 ```text
 bottle conf=0.82 center=(321,244) depth=0.635m xyz_mm=(12.4,8.7,635.0)
 ```
 
-含义：YOLO 检测到 `bottle`，检测框中心像素为 `(321,244)`，该点深度为 `0.635m`，转换后的相机坐标为 `(X=12.4mm, Y=8.7mm, Z=635.0mm)`。
-
-如果使用 `--csv`，CSV 会包含时间、类别、置信度、中心像素、深度、三维坐标和检测框坐标。
-
-无窗口测试一帧并自动退出：
+## 6. 采集数据
 
 ```powershell
-python .\text\realsense_yolov8_3d.py --model yolov8n.pt --no-window --max-frames 1
+python .\scripts\capture_dataset.py --output-dir .\data\raw
 ```
 
-## 实现流程
+按 `s` 保存一组数据：
 
-1. 启动 RealSense depth/color 流。
-2. 使用 `rs.align(rs.stream.color)` 将深度帧对齐到彩色帧。
-3. 将彩色帧传给 YOLOv8 做目标检测。
-4. 对每个检测框取中心点 `(center_x, center_y)`。
-5. 在中心点附近取有效深度的中位数，减少深度空洞影响。
-6. 使用 `rs.rs2_deproject_pixel_to_point(depth_intrinsics, [x, y], depth_m)` 得到相机坐标系三维坐标。
-7. 在画面中标注中心点和坐标，并可选写入 CSV。
+```text
+color_000001.png
+depth_000001.npy
+depth_vis_000001.png
+meta_000001.json
+```
+
+深度会以 `.npy` 保存毫米值，不只是 8-bit 可视化图。
 
 ## 注意事项
 
-- 该坐标是相机坐标，不是机械臂基坐标。要给机械臂使用，还需要做手眼标定或相机到机械臂基座的外参变换。
-- 深度值为 `0` 通常表示该像素没有有效深度，脚本会在中心点附近找有效深度；如果仍找不到，会输出 `depth=invalid`。
-- D455f 与 D435i 的 SDK 调用方式基本一致，关键是保证深度和彩色流分辨率可被你的设备支持。
-- 如果窗口卡住或相机被占用，关闭其它 RealSense Viewer、相机程序或重新插拔相机后再运行。
+- 当前分割是 HSV MVP，适合先跑通链路；后续可以把 `WatermelonSegmenter.segment()` 内部替换为 YOLO-Seg。
+- `configs/T_base_camera.yaml` 现在是占位的单位变换，不能直接用于真实机械臂抓取。
+- 单视角体积估计只看得到西瓜可见表面，体积结果需要后续用真实数据做回归校正。
+- 修改相机流配置时，如果设备不支持指定分辨率或帧率，代码会尽量回退到 SDK 默认 profile。
+
+## 排查：只显示 `load extensions` 后退出
+
+如果命令行只显示类似下面一行，然后回到提示符：
+
+```text
+load extensions from ...\site-packages\pyorbbecsdk\extensions
+```
+
+先运行：
+
+```powershell
+python .\scripts\test_camera.py --list-devices
+```
+
+如果输出 `Found 0 Orbbec device(s)`，说明 `pyorbbecsdk` 当前没有发现相机。优先检查：
+
+- 相机供电、USB/网线连接、网口 IP 配置。
+- Orbbec Viewer 是否能看到相机。
+- 是否有其它程序正在占用设备。
+- 当前 PyCharm/PowerShell 使用的 Python 环境是否就是安装 `pyorbbecsdk2` 的 `Orbbec` 环境。

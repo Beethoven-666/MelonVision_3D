@@ -1,0 +1,7 @@
+camera_id: gemini_435le_01
+width: 0
+height: 0
+fps: 0
+align_to_color: true
+use_hw_d2c: false
+enable_sync: false

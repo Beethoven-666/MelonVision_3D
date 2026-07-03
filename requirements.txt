@@ -1,4 +1,8 @@
-pyrealsense2
+pyorbbecsdk2
 ultralytics
 opencv-python
 numpy
+pyyaml
+fastapi
+uvicorn
+pydantic

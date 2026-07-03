@@ -9,11 +9,18 @@ env/
 
 # Runtime outputs
 outputs/
+Log/
+text/Log/
+data/raw/
+data/labeled/
+point_clouds/
 
 # Model weights and generated binaries
 *.pt
 *.onnx
 *.engine
+*.npy
+*.ply
 
 # Local editor and OS files
 .vscode/
