@@ -24,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=0)
     parser.add_argument("--fps", type=int, default=0)
     parser.add_argument("--hw-d2c", action="store_true")
+    parser.add_argument("--startup-timeout-ms", type=int, default=10000)
+    parser.add_argument("--frame-timeout-ms", type=int, default=2000)
+    parser.add_argument("--no-full-frame-require", action="store_true")
     return parser.parse_args()
 
 
@@ -31,14 +34,21 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    camera = OrbbecCamera(args.width, args.height, args.fps, use_hw_d2c=args.hw_d2c)
+    camera = OrbbecCamera(
+        args.width,
+        args.height,
+        args.fps,
+        use_hw_d2c=args.hw_d2c,
+        full_frame_require=not args.no_full_frame_require,
+        startup_timeout_ms=args.startup_timeout_ms,
+    )
     camera.start()
     index = 1
 
     try:
         print("Press s to save a frame, q or Esc to exit.")
         while True:
-            color_bgr, depth_mm, timestamp = camera.get_rgbd()
+            color_bgr, depth_mm, timestamp = camera.get_rgbd(args.frame_timeout_ms)
             if color_bgr is None or depth_mm is None:
                 continue
 

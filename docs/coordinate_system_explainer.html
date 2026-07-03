@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>相机三维坐标系说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #18202a;
+      --muted: #5d6876;
+      --line: #d7dde5;
+      --green: #2b9f67;
+      --blue: #2563eb;
+      --red: #dc2626;
+      --amber: #b45309;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      letter-spacing: 0;
+    }
+
+    header {
+      padding: 28px 32px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.25;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      max-width: 940px;
+      line-height: 1.7;
+      font-size: 15px;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(420px, 1.35fr) minmax(320px, 0.65fr);
+      gap: 18px;
+      padding: 18px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+
+    section,
+    aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .canvas-wrap {
+      padding: 16px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #eef2f7;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      padding: 14px 16px 16px;
+      border-top: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--green);
+    }
+
+    .value {
+      color: var(--ink);
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .side {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .block {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .block:last-child {
+      border-bottom: 0;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+      line-height: 1.35;
+    }
+
+    p {
+      margin: 0 0 10px;
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 14px;
+    }
+
+    .equation {
+      display: grid;
+      gap: 8px;
+      margin: 12px 0;
+      padding: 12px;
+      border-radius: 6px;
+      background: #f2f5f8;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 15px;
+      color: #111827;
+    }
+
+    .result {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .metric {
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      flex: 0 0 auto;
+    }
+
+    .x { background: var(--red); }
+    .y { background: var(--green); }
+    .z { background: var(--blue); }
+    .mask { background: rgba(43, 159, 103, 0.45); border: 1px solid var(--green); }
+
+    ol {
+      margin: 0;
+      padding-left: 20px;
+      color: var(--muted);
+      line-height: 1.8;
+      font-size: 14px;
+    }
+
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #eef2f7;
+      color: #111827;
+      font-family: Consolas, "Courier New", monospace;
+    }
+
+    @media (max-width: 960px) {
+      main {
+        grid-template-columns: 1fr;
+        padding: 12px;
+      }
+
+      header {
+        padding: 22px 18px 14px;
+      }
+
+      .controls,
+      .result {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .controls,
+      .result,
+      .legend {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>像素 + 深度如何变成三维点</h1>
+    <p class="subtitle">
+      这个页面用你的 Orbbec RGB-D 流程解释相机坐标系：mask 先决定哪些像素属于目标，depth 给出每个像素的距离，再用相机内参把目标像素反投影成三维点云。
+    </p>
+  </header>
+
+  <main>
+    <section>
+      <div class="canvas-wrap">
+        <canvas id="scene" width="1280" height="720" aria-label="相机坐标系交互图"></canvas>
+      </div>
+      <div class="controls">
+        <label>
+          像素 u
+          <input id="u" type="range" min="0" max="1280" value="760">
+          <span class="value" id="uValue"></span>
+        </label>
+        <label>
+          像素 v
+          <input id="v" type="range" min="0" max="800" value="440">
+          <span class="value" id="vValue"></span>
+        </label>
+        <label>
+          深度 Z
+          <input id="z" type="range" min="0.2" max="3.0" step="0.01" value="1.00">
+          <span class="value" id="zValue"></span>
+        </label>
+        <label>
+          mask 半径
+          <input id="radius" type="range" min="35" max="180" value="95">
+          <span class="value" id="radiusValue"></span>
+        </label>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="block">
+        <h2>当前三维点</h2>
+        <p>这里使用你相机当前读到的近似内参：<code>fx=610.85</code>、<code>fy=610.65</code>、<code>cx=644.34</code>、<code>cy=403.04</code>。</p>
+        <div class="result">
+          <div class="metric">
+            <span>X 右正左负</span>
+            <strong id="xMetric"></strong>
+          </div>
+          <div class="metric">
+            <span>Y 下正上负</span>
+            <strong id="yMetric"></strong>
+          </div>
+          <div class="metric">
+            <span>Z 前方深度</span>
+            <strong id="zMetric"></strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="block">
+        <h2>反投影公式</h2>
+        <div class="equation">
+          <div>X = (u - cx) * Z / fx</div>
+          <div>Y = (v - cy) * Z / fy</div>
+          <div>Z = depth</div>
+        </div>
+      <p>每一个 mask 内的有效深度像素都会套用这三个公式，所以会得到很多个三维点，也就是目标点云。左侧相机坐标系里的三维点，对应右侧图像平面里的像素点。</p>
+      </div>
+
+      <div class="block">
+        <h2>颜色说明</h2>
+        <div class="legend">
+          <div class="legend-item"><span class="swatch mask"></span>绿色区域：mask 目标像素</div>
+          <div class="legend-item"><span class="swatch x"></span>红色轴：X，向右为正</div>
+          <div class="legend-item"><span class="swatch y"></span>绿色轴：Y，向下为正</div>
+          <div class="legend-item"><span class="swatch z"></span>蓝色轴：Z，向前为正</div>
+        </div>
+      </div>
+
+      <div class="block">
+        <h2>程序里的步骤</h2>
+        <ol>
+          <li>HSV 或模型生成 <code>mask</code>。</li>
+          <li>只保留 <code>mask &gt; 0</code> 且深度有效的像素。</li>
+          <li>读取这些像素的 <code>u, v, depth</code>。</li>
+          <li>用内参反投影成 <code>X, Y, Z</code>。</li>
+          <li>对点云做中心、尺寸、体积和抓取点计算。</li>
+        </ol>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    const canvas = document.getElementById("scene");
+    const ctx = canvas.getContext("2d");
+    const controls = {
+      u: document.getElementById("u"),
+      v: document.getElementById("v"),
+      z: document.getElementById("z"),
+      radius: document.getElementById("radius")
+    };
+
+    const labels = {
+      u: document.getElementById("uValue"),
+      v: document.getElementById("vValue"),
+      z: document.getElementById("zValue"),
+      radius: document.getElementById("radiusValue"),
+      x: document.getElementById("xMetric"),
+      y: document.getElementById("yMetric"),
+      zm: document.getElementById("zMetric")
+    };
+
+    const intr = { fx: 610.8459, fy: 610.6470, cx: 644.3382, cy: 403.0422 };
+    const image = { width: 1280, height: 800 };
+
+    function projectToCanvas(u, v) {
+      const margin = 500;
+      const planeW = 700;
+      const planeH = planeW * image.height / image.width;
+      const originX = margin;
+      const originY = 104;
+      return {
+        x: originX + u / image.width * planeW,
+        y: originY + v / image.height * planeH,
+        plane: { x: originX, y: originY, w: planeW, h: planeH }
+      };
+    }
+
+    function drawArrow(x1, y1, x2, y2, color, label) {
+      const head = 12;
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - head * Math.cos(angle - Math.PI / 6), y2 - head * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(x2 - head * Math.cos(angle + Math.PI / 6), y2 - head * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+      ctx.font = "700 24px Segoe UI, Arial";
+      ctx.fillText(label, x2 + 10, y2 + 6);
+    }
+
+    function drawScene() {
+      const u = Number(controls.u.value);
+      const v = Number(controls.v.value);
+      const z = Number(controls.z.value);
+      const radius = Number(controls.radius.value);
+      const X = (u - intr.cx) * z / intr.fx;
+      const Y = (v - intr.cy) * z / intr.fy;
+
+      labels.u.textContent = `${u.toFixed(0)} px`;
+      labels.v.textContent = `${v.toFixed(0)} px`;
+      labels.z.textContent = `${z.toFixed(2)} m`;
+      labels.radius.textContent = `${radius.toFixed(0)} px`;
+      labels.x.textContent = `${X.toFixed(3)} m`;
+      labels.y.textContent = `${Y.toFixed(3)} m`;
+      labels.zm.textContent = `${z.toFixed(3)} m`;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const p = projectToCanvas(u, v);
+      const plane = p.plane;
+
+      ctx.fillStyle = "#111827";
+      ctx.font = "700 24px Segoe UI, Arial";
+      ctx.fillText("相机坐标系", 86, 82);
+      ctx.fillText("图像平面", plane.x, 82);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "#c9d2dd";
+      ctx.lineWidth = 2;
+      ctx.fillRect(plane.x, plane.y, plane.w, plane.h);
+      ctx.strokeRect(plane.x, plane.y, plane.w, plane.h);
+
+      ctx.fillStyle = "#eef2f7";
+      for (let gx = 0; gx <= 8; gx += 1) {
+        const x = plane.x + gx * plane.w / 8;
+        ctx.fillRect(x, plane.y, 1, plane.h);
+      }
+      for (let gy = 0; gy <= 5; gy += 1) {
+        const y = plane.y + gy * plane.h / 5;
+        ctx.fillRect(plane.x, y, plane.w, 1);
+      }
+
+      const c = projectToCanvas(intr.cx, intr.cy);
+      ctx.fillStyle = "#111827";
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = "600 18px Segoe UI, Arial";
+      ctx.fillText("光心 (cx, cy)", c.x + 12, c.y - 10);
+
+      const sx = radius * plane.w / image.width;
+      const sy = radius * plane.h / image.height;
+      ctx.fillStyle = "rgba(43, 159, 103, 0.28)";
+      ctx.strokeStyle = "#2b9f67";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, sx, sy * 1.25, 0.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.strokeStyle = "#dc2626";
+      ctx.setLineDash([8, 8]);
+      ctx.beginPath();
+      ctx.moveTo(c.x, p.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+
+      ctx.strokeStyle = "#2b9f67";
+      ctx.beginPath();
+      ctx.moveTo(p.x, c.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = "#dc2626";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = "700 18px Segoe UI, Arial";
+      ctx.fillText(`像素点 (${u.toFixed(0)}, ${v.toFixed(0)})`, p.x + 14, p.y + 6);
+
+      const ox = 220;
+      const oy = 430;
+      ctx.fillStyle = "#111827";
+      ctx.beginPath();
+      ctx.arc(ox, oy, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = "700 20px Segoe UI, Arial";
+      ctx.fillText("相机光心 O", ox - 52, oy + 36);
+
+      drawArrow(ox, oy, ox + 155, oy, "#dc2626", "X+");
+      drawArrow(ox, oy, ox, oy + 130, "#2b9f67", "Y+");
+      drawArrow(ox, oy, ox + 190, oy - 130, "#2563eb", "Z+");
+
+      const targetX = ox + 85 + Math.max(-90, Math.min(90, X * 500));
+      const targetY = oy + Math.max(-86, Math.min(86, Y * 500));
+      const targetZShift = Math.min(130, z * 48);
+      const target = { x: targetX + targetZShift * 0.75, y: targetY - targetZShift * 0.55 };
+
+      ctx.strokeStyle = "#64748b";
+      ctx.lineWidth = 3;
+      ctx.setLineDash([7, 7]);
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(target.x, target.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = "#94a3b8";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 9]);
+      ctx.beginPath();
+      ctx.moveTo(target.x + 58, target.y);
+      ctx.lineTo(p.x - 10, p.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = "rgba(43, 159, 103, 0.35)";
+      ctx.strokeStyle = "#2b9f67";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.ellipse(target.x, target.y, 58, 42, -0.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = "#111827";
+      ctx.font = "700 20px Segoe UI, Arial";
+      ctx.fillText(`三维点 (${X.toFixed(2)}, ${Y.toFixed(2)}, ${z.toFixed(2)}) m`, 72, 180);
+
+      ctx.fillStyle = "#5d6876";
+      ctx.font = "16px Segoe UI, Arial";
+      ctx.fillText("左侧是相机和三维坐标系，右侧是图像平面。拖动滑块观察像素点和三维点如何对应。", 56, 660);
+    }
+
+    Object.values(controls).forEach((control) => {
+      control.addEventListener("input", drawScene);
+    });
+    drawScene();
+  </script>
+</body>
+</html>

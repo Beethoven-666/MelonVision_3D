@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-这是一个基于 Orbbec Gemini 435Le、`pyorbbecsdk2` 和 OpenCV/YOLO 的纯 Python 西瓜三维感知项目。程序从 Orbbec 相机获取对齐后的 RGB-D 数据，先用 HSV MVP 分割西瓜，再通过 mask 和 depth 生成局部点云，计算三维中心、PCA 尺寸、吸盘抓取点、表面法向、预抓取点和椭球体积，并可通过 FastAPI 暴露给机械臂系统。
+这是一个基于 Orbbec Gemini 435Le、`pyorbbecsdk2` 和 OpenCV/YOLO 的纯 Python 西瓜三维感知项目。程序从 Orbbec 相机获取对齐后的 RGB-D 数据，先用 HSV MVP 分割西瓜，再通过 mask 和 depth 生成局部点云，计算三维中心、PCA 尺寸、吸盘抓取点、表面法向、预抓取点和椭球体积，并为五轴注塑机械手生成 `x,y1,y2,z1,z2` 每轴 4 个值的 PLC 命令。
 
 旧的 RealSense 入口仍保留为兼容包装，但底层已经切换为 Orbbec。
 
@@ -25,6 +25,8 @@
 - `geometry/pose_estimator.py`：PCA 估计三维中心、姿态和三轴尺寸。
 - `geometry/suction_grasp.py`：估计吸盘接触点、表面法向和预抓取点。
 - `volume/volume_estimator.py`：椭球体积估计。
+- `robot/injection_molding_robot.py`：五轴注塑机械手命令生成，输出 `x,y1,y2,z1,z2` 的 20 个值。
+- `robot/modbus_tcp_client.py`：可选 Modbus TCP 写 holding registers。
 - `calibration/transform.py`：相机坐标系到 `robot_base` 坐标系的刚体变换。
 - `api/server.py`：FastAPI 路由和最新结果缓存。
 
@@ -44,6 +46,7 @@ python -m pip install -r requirements.txt
 - `fastapi`
 - `uvicorn`
 - `pydantic`
+- `pymodbus`
 
 ## 常用命令
 
@@ -108,16 +111,24 @@ GET /api/v1/watermelon/best_target
 目标接口返回 `status`、`timestamp`、`camera_id` 和可选的 `target`。当 `status == "ok"` 时，`target` 内包含：
 
 - `center_base_m`
+- `target_selection_score`
+- `target_selection`
 - `axes_m`
 - `volume`
 - `grasp.contact_point_base_m`
 - `grasp.surface_normal_base`
 - `grasp.approach_vector_base`
 - `grasp.pregrasp_point_base_m`
+- `grasp.score_breakdown`
+- `grasp.method`
+- `grasp.is_inferred`
+- `robot_command`
 
 ## 开发注意事项
 
 - 当前 HSV 分割只是 MVP，现场需要根据光照调阈值。后续训练 YOLO-Seg 时，保持 `WatermelonSegmenter.segment()` 输出格式不变即可。
+- 当前机械臂按五轴注塑机械手处理，默认不做侧面椭球吸取。吸盘点选择使用真实可见点云候选点评分，并通过 `--tool-normal-base` 约束固定吸盘方向。
+- `configs/injection_robot.yaml` 控制五轴映射、每轴速度/加速度/加加速度、寄存器缩放和 Modbus 地址。PLC 侧真实地址、比例、限位必须现场确认后再启用 `--write-modbus`。
 - 单视角体积估计受可见面限制，工程使用前需要真实数据校正。
 - 修改相机流配置时要确认 Gemini 435Le 实际支持；代码会尽量回退到 SDK 默认 profile。
 - 普通 CI 或无相机环境无法完整跑通相机链路；至少可以运行 Python 语法编译和合成数据链路测试。

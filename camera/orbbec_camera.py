@@ -42,6 +42,8 @@ class OrbbecCamera:
         align_to_color: bool = True,
         use_hw_d2c: bool = False,
         enable_sync: bool = False,
+        full_frame_require: bool = True,
+        startup_timeout_ms: int = 10000,
     ) -> None:
         self.width = width
         self.height = height
@@ -49,6 +51,8 @@ class OrbbecCamera:
         self.align_to_color = align_to_color
         self.use_hw_d2c = use_hw_d2c
         self.enable_sync = enable_sync
+        self.full_frame_require = full_frame_require
+        self.startup_timeout_ms = startup_timeout_ms
         self.pipeline: Optional[Pipeline] = None
         self.config: Optional[Config] = None
         self.align_filter: Optional[AlignFilter] = None
@@ -86,22 +90,25 @@ class OrbbecCamera:
             depth_profile = self._select_depth_profile()
             self.config.enable_stream(color_profile)
             self.config.enable_stream(depth_profile)
-            try:
-                self.config.set_frame_aggregate_output_mode(
-                    OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE
-                )
-            except Exception:
-                pass
+            if self.full_frame_require:
+                try:
+                    self.config.set_frame_aggregate_output_mode(
+                        OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE
+                    )
+                except Exception:
+                    pass
 
         self.pipeline.start(self.config)
         self.running = True
         if self.align_to_color and not self.use_hw_d2c:
             self.align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
 
-        frames = self.pipeline.wait_for_frames(1000)
+        frames = self._wait_for_first_frames()
         if frames is None:
             self.stop()
-            raise RuntimeError("Camera started, but no valid frame set was received.")
+            raise RuntimeError(
+                f"Camera started, but no valid frame set was received within {self.startup_timeout_ms} ms."
+            )
 
         self.camera_param = self.pipeline.get_camera_param()
 
@@ -146,6 +153,25 @@ class OrbbecCamera:
             "depth_timestamp": float(depth_frame.get_timestamp()),
         }
         return color_bgr, depth_mm, timestamp
+
+    def _wait_for_first_frames(self):
+        if self.pipeline is None:
+            raise RuntimeError("Camera pipeline is not initialized.")
+
+        timeout_ms = max(int(self.startup_timeout_ms), 1000)
+        deadline = cv2.getTickCount() / cv2.getTickFrequency() + timeout_ms / 1000.0
+        while cv2.getTickCount() / cv2.getTickFrequency() < deadline:
+            frames = self.pipeline.wait_for_frames(1000)
+            if frames is None:
+                continue
+            if not self.full_frame_require:
+                return frames
+            try:
+                if frames.get_color_frame() is not None and frames.get_depth_frame() is not None:
+                    return frames
+            except Exception:
+                return frames
+        return None
 
     def get_intrinsics(self) -> dict[str, dict[str, float]]:
         if self.camera_param is None:

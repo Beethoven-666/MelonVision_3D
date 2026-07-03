@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=0)
     parser.add_argument("--fps", type=int, default=0)
     parser.add_argument("--hw-d2c", action="store_true", help="Use hardware depth-to-color alignment.")
+    parser.add_argument("--startup-timeout-ms", type=int, default=10000)
+    parser.add_argument("--no-full-frame-require", action="store_true")
     return parser.parse_args()
 
 
@@ -54,7 +56,14 @@ def _extrinsic_dict(extrinsic) -> dict[str, object]:
 
 def main() -> None:
     args = parse_args()
-    camera = OrbbecCamera(args.width, args.height, args.fps, use_hw_d2c=args.hw_d2c)
+    camera = OrbbecCamera(
+        args.width,
+        args.height,
+        args.fps,
+        use_hw_d2c=args.hw_d2c,
+        full_frame_require=not args.no_full_frame_require,
+        startup_timeout_ms=args.startup_timeout_ms,
+    )
     camera.start()
     try:
         param = camera.camera_param

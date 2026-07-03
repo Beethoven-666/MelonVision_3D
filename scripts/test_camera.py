@@ -20,6 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=0)
     parser.add_argument("--fps", type=int, default=0)
     parser.add_argument("--hw-d2c", action="store_true", help="Use hardware depth-to-color alignment.")
+    parser.add_argument("--startup-timeout-ms", type=int, default=10000)
+    parser.add_argument("--frame-timeout-ms", type=int, default=2000)
+    parser.add_argument("--no-full-frame-require", action="store_true")
     parser.add_argument("--no-window", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--list-devices", action="store_true", help="Only list Orbbec devices and exit.")
@@ -47,7 +50,14 @@ def main() -> None:
         return
 
     print_devices(devices)
-    camera = OrbbecCamera(args.width, args.height, args.fps, use_hw_d2c=args.hw_d2c)
+    camera = OrbbecCamera(
+        args.width,
+        args.height,
+        args.fps,
+        use_hw_d2c=args.hw_d2c,
+        full_frame_require=not args.no_full_frame_require,
+        startup_timeout_ms=args.startup_timeout_ms,
+    )
     try:
         print("[INFO] Starting RGB-D stream...")
         camera.start()
@@ -60,7 +70,7 @@ def main() -> None:
         print("Intrinsics:", camera.get_intrinsics())
         print("Press q or Esc to exit.")
         while True:
-            color_bgr, depth_mm, _timestamp = camera.get_rgbd()
+            color_bgr, depth_mm, _timestamp = camera.get_rgbd(args.frame_timeout_ms)
             if color_bgr is None or depth_mm is None:
                 print("[WARN] No valid RGB-D frame received.")
                 continue

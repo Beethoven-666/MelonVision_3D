@@ -8,6 +8,7 @@ Gemini 435Le 采集 RGB-D
 -> mask + depth 生成局部点云
 -> PCA 估计三维中心、主轴和尺寸
 -> 估计吸盘接触点、表面法向和预抓取点
+-> 生成五轴注塑机械手 x/y1/y2/z1/z2 的 20 个 PLC 命令值
 -> 椭球体积预测
 -> FastAPI 向机械臂提供最新结果
 ```
@@ -33,6 +34,9 @@ D:\MelonVision_3D
 │   └── suction_grasp.py            # 吸盘接触点和法向
 ├── volume
 │   └── volume_estimator.py         # 椭球体积估计
+├── robot
+│   ├── injection_molding_robot.py  # 五轴注塑机械手命令生成
+│   └── modbus_tcp_client.py        # 可选 Modbus TCP 写 PLC
 ├── api
 │   ├── schemas.py
 │   └── server.py
@@ -42,6 +46,7 @@ D:\MelonVision_3D
 │   └── capture_dataset.py          # 按键保存 RGB-D 数据
 └── configs
     ├── camera.yaml
+    ├── injection_robot.yaml
     └── T_base_camera.yaml
 ```
 
@@ -52,6 +57,8 @@ python -m pip install -r requirements.txt
 ```
 
 `pyorbbecsdk2` 的导入名仍然是 `pyorbbecsdk`。
+
+如果启用 `--write-modbus`，需要 `pymodbus`，它已经写入 `requirements.txt`。
 
 ## 1. 测试 Orbbec 相机
 
@@ -95,6 +102,35 @@ python .\main_debug_view.py
 
 当前 MVP 使用 HSV 阈值做西瓜分割，现场需要根据光照调整 `perception/watermelon_segmenter.py` 中的阈值。
 
+吸盘点现在使用可见点云候选点评分，不再只是取最近一片点云的均值。评分项包括：
+
+- `front`：候选点越靠近相机，越像暴露表面的前端，分越高。
+- `edge`：候选点离 mask 边缘越远，越不容易漏气，分越高。
+- `flatness`：局部 PCA 曲率越小，吸盘越容易密封，分越高。
+- `normal`：局部法向越朝向相机或指定接近方向，分越高。
+- `depth_stability`：局部深度越稳定，越不像噪声点，分越高。
+
+多西瓜情况下，程序会对每个西瓜分别计算吸盘点和目标选择分。目标选择分主要看抓取点质量，同时加入检测置信度、点云数量、姿态置信度和到机械臂的水平距离。多个候选西瓜高度接近时，会提高“离机械臂近”的权重。
+
+当前机械臂规格按“五轴注塑机械手”处理，程序不再默认做侧面椭球吸取。执行策略是：在相机真实可见、且符合固定吸盘方向的表面上选择吸点，然后生成 PLC 所需的 20 个值：
+
+```text
+x, y1, y2, z1, z2
+每轴：position_mm, velocity_mm_s, acceleration_mm_s2, jerk_mm_s3
+总数：5 x 4 = 20
+```
+
+默认配置见 `configs/injection_robot.yaml`。默认映射为 `x <- X`、`y1/y2 <- Y`、`z1/z2 <- Z`，实际设备如果 y1/y2 或 z1/z2 有偏置、限位或不同速度，需要在该 YAML 中修改。
+
+可以通过下面参数调机械臂相关偏好：
+
+```powershell
+python .\main_debug_view.py --robot-origin-base 0 0 0 --tool-normal-base 0 0 1 --robot-config .\configs\injection_robot.yaml
+python .\main_api.py --robot-origin-base 0 0 0 --tool-normal-base 0 0 1 --robot-config .\configs\injection_robot.yaml
+```
+
+`--tool-normal-base` 表示吸盘希望接触的表面法向，默认 `0 0 1`。如果你的 `robot_base` 中 Z 轴向下或机械手吸盘方向不同，需要按实际坐标系调整。
+
 ## 4. 运行 API 服务
 
 ```powershell
@@ -115,6 +151,16 @@ GET /api/v1/watermelon/best_target
 ```
 
 返回目标坐标默认位于 `robot_base` 坐标系，单位为米。当前 `configs/T_base_camera.yaml` 是单位矩阵占位，正式抓取前必须完成相机到机械臂基坐标系的标定。
+
+当 `status == "ok"` 时，`target.robot_command.register_values` 是准备写给 PLC 的 20 个整数值。默认缩放比例为 `10`，即 1 mm 会写成 10；可在 `configs/injection_robot.yaml` 的 `plc_registers.scale` 修改。
+
+如果要让程序直接通过 Modbus TCP 写 PLC，需要显式打开：
+
+```powershell
+python .\main_api.py --write-modbus --modbus-host 192.168.1.10 --modbus-port 502 --modbus-start-address 0
+```
+
+默认不写 PLC，避免调试视觉时误动作。
 
 ## 5. 类似旧文件的 YOLO 测试程序
 
@@ -192,3 +238,38 @@ python .\scripts\test_camera.py --list-devices
 - Orbbec Viewer 是否能看到相机。
 - 是否有其它程序正在占用设备。
 - 当前 PyCharm/PowerShell 使用的 Python 环境是否就是安装 `pyorbbecsdk2` 的 `Orbbec` 环境。
+
+## 排查：`Wait for frame timeout`
+
+如果看到：
+
+```text
+Wait for frame timeout, you can try to increase the wait time! current timeout=1000
+Camera started, but no valid frame set was received.
+```
+
+说明 SDK 已经发现设备，但启动 RGB-D 流后没有在等待时间内收到有效帧。先按下面顺序试：
+
+```powershell
+python .\scripts\test_camera.py --startup-timeout-ms 20000 --frame-timeout-ms 5000
+```
+
+如果仍然超时，放宽“必须 RGB 和 Depth 成对输出”的要求：
+
+```powershell
+python .\scripts\test_camera.py --startup-timeout-ms 20000 --frame-timeout-ms 5000 --no-full-frame-require
+```
+
+如果你的设备支持硬件 D2C，再试：
+
+```powershell
+python .\scripts\test_camera.py --hw-d2c --startup-timeout-ms 20000 --frame-timeout-ms 5000
+```
+
+调试界面也可以带同样参数：
+
+```powershell
+python .\main_debug_view.py --startup-timeout-ms 20000 --frame-timeout-ms 5000 --no-full-frame-require
+```
+
+日志里的 `Current firmware version ... < minimum required version ... CCP is not supported` 是固件能力 warning，不一定会阻止取流；但如果 Orbbec Viewer 也无法稳定出图，建议升级相机固件或切换到 Viewer 推荐的流配置。

@@ -9,6 +9,7 @@ import numpy as np
 from calibration.transform import load_transform_from_yaml
 from camera.orbbec_camera import OrbbecCamera, list_orbbec_devices
 from perception.watermelon_pipeline import WatermelonVisionProcessor
+from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
 from scripts.test_camera import depth_to_colormap
 
 
@@ -18,9 +19,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=0)
     parser.add_argument("--fps", type=int, default=0)
     parser.add_argument("--hw-d2c", action="store_true")
+    parser.add_argument("--startup-timeout-ms", type=int, default=10000)
+    parser.add_argument("--frame-timeout-ms", type=int, default=2000)
+    parser.add_argument("--no-full-frame-require", action="store_true")
     parser.add_argument("--transform", default="configs/T_base_camera.yaml")
     parser.add_argument("--camera-id", default="gemini_435le_01")
     parser.add_argument("--min-points", type=int, default=300)
+    parser.add_argument("--robot-origin-base", type=float, nargs=3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--robot-distance-norm", type=float, default=1.5)
+    parser.add_argument("--same-height-band", type=float, default=0.08)
+    parser.add_argument("--grasp-mode", choices=("injection", "visible"), default="injection")
+    parser.add_argument("--tool-normal-base", type=float, nargs=3, default=(0.0, 0.0, 1.0))
+    parser.add_argument("--robot-config", default="configs/injection_robot.yaml")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--print-json", action="store_true")
     return parser.parse_args()
@@ -82,7 +92,12 @@ def draw_debug(
     if target:
         volume = target["volume"]["volume_liter"]
         grasp_score = target["grasp_confidence"]
-        cv2.putText(overlay, f"volume: {volume:.2f} L  grasp: {grasp_score:.2f}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        target_score = target.get("target_selection_score", 0.0)
+        method = target.get("grasp", {}).get("method", "unknown")
+        command_count = target.get("robot_command", {}).get("register_count", 0)
+        cv2.putText(overlay, f"volume: {volume:.2f} L  grasp: {grasp_score:.2f}  target: {target_score:.2f}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        cv2.putText(overlay, f"method: {method}", (16, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(overlay, f"plc values: {command_count}", (16, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     elif result.get("message"):
         cv2.putText(overlay, str(result["message"])[:80], (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
@@ -104,12 +119,27 @@ def main() -> None:
         return
 
     transform = load_transform_from_yaml(args.transform)
+    robot_config = load_injection_robot_config(args.robot_config)
+    robot_command_builder = InjectionRobotCommandBuilder(robot_config)
     processor = WatermelonVisionProcessor(
         transform=transform,
         camera_id=args.camera_id,
         min_points=args.min_points,
+        robot_origin_base=tuple(args.robot_origin_base),
+        robot_distance_norm_m=args.robot_distance_norm,
+        same_height_band_m=args.same_height_band,
+        grasp_mode=args.grasp_mode,
+        tool_normal_base=tuple(args.tool_normal_base),
+        robot_command_builder=robot_command_builder,
     )
-    camera = OrbbecCamera(args.width, args.height, args.fps, use_hw_d2c=args.hw_d2c)
+    camera = OrbbecCamera(
+        args.width,
+        args.height,
+        args.fps,
+        use_hw_d2c=args.hw_d2c,
+        full_frame_require=not args.no_full_frame_require,
+        startup_timeout_ms=args.startup_timeout_ms,
+    )
     try:
         print("[INFO] Starting RGB-D stream...")
         camera.start()
@@ -122,7 +152,7 @@ def main() -> None:
         intrinsic = camera.get_color_intrinsic()
         print("Press q or Esc to exit.")
         while True:
-            color_bgr, depth_mm, _timestamp = camera.get_rgbd()
+            color_bgr, depth_mm, _timestamp = camera.get_rgbd(args.frame_timeout_ms)
             if color_bgr is None or depth_mm is None:
                 continue
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Point3D(BaseModel):
@@ -31,6 +31,10 @@ class GraspResult(BaseModel):
     pregrasp_point_base_m: Point3D
     pregrasp_offset_m: float
     score: float
+    contact_pixel: Optional[list[int]] = None
+    score_breakdown: dict[str, float] = Field(default_factory=dict)
+    method: str = "unknown"
+    is_inferred: bool = False
 
 
 class WatermelonTarget(BaseModel):
@@ -40,10 +44,14 @@ class WatermelonTarget(BaseModel):
     detection_confidence: float
     pose_confidence: float
     grasp_confidence: float
+    target_selection_score: float
+    target_selection: dict[str, float] = Field(default_factory=dict)
     center_base_m: Point3D
     axes_m: dict[str, float]
     volume: VolumeResult
     grasp: GraspResult
+    grasp_mode: str = "injection"
+    robot_command: dict[str, object] = Field(default_factory=dict)
 
 
 class BestTargetResponse(BaseModel):
