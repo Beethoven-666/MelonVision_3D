@@ -10,6 +10,7 @@ from geometry.pose_estimator import estimate_pose_by_pca
 from geometry.suction_grasp import choose_suction_grasp
 from perception.pointcloud_builder import mask_depth_to_points
 from perception.watermelon_segmenter import WatermelonSegmenter
+from robot.dual_arm_planner import DualArmInjectionPlanner
 from robot.injection_molding_robot import InjectionRobotCommandBuilder
 from volume.volume_estimator import estimate_volume_by_ellipsoid
 
@@ -33,6 +34,7 @@ class WatermelonVisionProcessor:
         grasp_mode: str = "injection",
         tool_normal_base: tuple[float, float, float] = (0.0, 0.0, 1.0),
         robot_command_builder: InjectionRobotCommandBuilder | None = None,
+        robot_config: dict[str, Any] | None = None,
         segmenter: WatermelonSegmenter | None = None,
     ) -> None:
         self.transform = transform
@@ -44,9 +46,16 @@ class WatermelonVisionProcessor:
         self.robot_origin_base = np.asarray(robot_origin_base, dtype=np.float64).reshape(3)
         self.robot_distance_norm_m = robot_distance_norm_m
         self.same_height_band_m = same_height_band_m
-        self.grasp_mode = "injection" if grasp_mode in ("injection", "visible") else "injection"
+        self.grasp_mode = "injection"
         self.tool_normal_base = _unit_vector(np.asarray(tool_normal_base, dtype=np.float64).reshape(3))
         self.robot_command_builder = robot_command_builder or InjectionRobotCommandBuilder()
+        self.robot_config = robot_config or self.robot_command_builder.config
+        self.dual_arm_planner = DualArmInjectionPlanner(
+            transform=self.transform,
+            command_builder=self.robot_command_builder,
+            config=self.robot_config,
+            pregrasp_offset_m=self.pregrasp_offset_m,
+        )
         self.segmenter = segmenter or WatermelonSegmenter(
             depth_min_m=min_depth_m,
             depth_max_m=max_depth_m,
@@ -69,8 +78,8 @@ class WatermelonVisionProcessor:
         candidates = []
         low_point_counts: list[int] = []
         errors: list[str] = []
-        for detection in detections:
-            candidate = self._evaluate_detection(detection, depth_mm, intrinsic)
+        for target_id, detection in enumerate(detections, start=1):
+            candidate = self._evaluate_detection(target_id, detection, depth_mm, intrinsic)
             if candidate.get("status") == "ok":
                 candidates.append(candidate)
                 continue
@@ -92,18 +101,20 @@ class WatermelonVisionProcessor:
             )
 
         self._score_target_candidates(candidates)
-        best = max(candidates, key=lambda item: float(item["target_score"]))
+        dual_arm_plan = self.dual_arm_planner.plan(candidates)
+        primary_target_id = int(dual_arm_plan["selected_targets"][0]["target_id"])
+        best = next(candidate for candidate in candidates if int(candidate["target_id"]) == primary_target_id)
         detection = best["detection"]
         points_camera = best["points_camera"]
         pose = best["pose"]
-        grasp = best["grasp"]
         volume = best["volume"]
         center_base = best["center_base"]
-        contact_base = best["contact_base"]
-        normal_base = best["normal_base"]
-        pregrasp_base = best["pregrasp_base"]
+        primary_grasp = dual_arm_plan["primary_grasp"]
+        contact_base = _point_from_dict(primary_grasp["contact_point_base_m"])
+        normal_base = _point_from_dict(primary_grasp["surface_normal_base"])
+        pregrasp_base = _point_from_dict(primary_grasp["pregrasp_point_base_m"])
         approach_base = -normal_base
-        robot_command = best["robot_command"]
+        robot_command = dual_arm_plan["robot_command"]
 
         self.track_id += 1
         result = {
@@ -116,26 +127,28 @@ class WatermelonVisionProcessor:
                 "class_name": str(detection["class_name"]),
                 "detection_confidence": float(detection["score"]),
                 "pose_confidence": float(best["pose_confidence"]),
-                "grasp_confidence": float(grasp["score"]),
+                "grasp_confidence": float(primary_grasp["score"]),
                 "target_selection_score": float(best["target_score"]),
                 "target_selection": best["target_score_breakdown"],
                 "center_base_m": to_point3d(center_base),
                 "axes_m": pose["axes_length_m"],
                 "volume": volume,
+                "predicted_weight_kg": float(best["predicted_weight_kg"]),
                 "grasp": {
                     "contact_point_base_m": to_point3d(contact_base),
                     "surface_normal_base": to_point3d(normal_base),
                     "approach_vector_base": to_point3d(approach_base),
                     "pregrasp_point_base_m": to_point3d(pregrasp_base),
-                    "pregrasp_offset_m": float(grasp["pregrasp_offset_m"]),
-                    "score": float(grasp["score"]),
-                    "contact_pixel": grasp.get("contact_pixel"),
-                    "score_breakdown": grasp.get("score_breakdown", {}),
-                    "method": grasp.get("method", "unknown"),
-                    "is_inferred": bool(grasp.get("is_inferred", False)),
+                    "pregrasp_offset_m": self.pregrasp_offset_m,
+                    "score": float(primary_grasp["score"]),
+                    "contact_pixel": None,
+                    "score_breakdown": primary_grasp.get("score_breakdown", {}),
+                    "method": primary_grasp.get("method", "unknown"),
+                    "is_inferred": bool(primary_grasp.get("is_inferred", False)),
                 },
                 "grasp_mode": self.grasp_mode,
                 "robot_command": robot_command,
+                "dual_arm_plan": dual_arm_plan,
             },
         }
         debug.update(
@@ -144,7 +157,8 @@ class WatermelonVisionProcessor:
                 "mask": detection["mask"],
                 "points_camera": points_camera,
                 "pose": pose,
-                "grasp": grasp,
+                "grasp": best["visible_grasp"],
+                "dual_arm_plan": dual_arm_plan,
                 "volume": volume,
                 "result": result,
             }
@@ -153,6 +167,7 @@ class WatermelonVisionProcessor:
 
     def _evaluate_detection(
         self,
+        target_id: int,
         detection: dict[str, Any],
         depth_mm: np.ndarray,
         intrinsic: dict[str, float],
@@ -192,28 +207,18 @@ class WatermelonVisionProcessor:
             }
 
         center_base = self.transform.point_camera_to_base(pose["center_camera"])
-        contact_base = self.transform.point_camera_to_base(grasp["contact_point_camera"])
-        normal_base = self.transform.vector_camera_to_base(grasp["surface_normal_camera"])
-        pregrasp_base = self.transform.point_camera_to_base(grasp["pregrasp_point_camera"])
         pose_confidence = self._pose_confidence(points_camera.shape[0])
-        robot_command = self.robot_command_builder.build_from_grasp(
-            contact_point_base_m=contact_base,
-            pregrasp_point_base_m=pregrasp_base,
-        )
         return {
             "status": "ok",
+            "target_id": target_id,
             "detection": detection,
             "points_camera": points_camera,
             "pose": pose,
-            "grasp": grasp,
+            "visible_grasp": grasp,
             "volume": volume,
             "center_base": center_base,
-            "contact_base": contact_base,
-            "normal_base": normal_base,
-            "pregrasp_base": pregrasp_base,
             "pose_confidence": pose_confidence,
             "point_count": int(points_camera.shape[0]),
-            "robot_command": robot_command,
             "target_score": 0.0,
             "target_score_breakdown": {},
         }
@@ -231,7 +236,7 @@ class WatermelonVisionProcessor:
         for item in candidates:
             target_score, target_score_breakdown = self._target_selection_score(
                 detection=item["detection"],
-                grasp=item["grasp"],
+                grasp=item["visible_grasp"],
                 point_count=int(item["point_count"]),
                 center_base=item["center_base"],
                 pose_confidence=float(item["pose_confidence"]),
@@ -311,3 +316,7 @@ def _unit_vector(vector: np.ndarray) -> np.ndarray:
     if norm <= 1e-9:
         return np.array([0.0, 0.0, 1.0], dtype=np.float64)
     return vector / norm
+
+
+def _point_from_dict(point: dict[str, float]) -> np.ndarray:
+    return np.array([float(point["x"]), float(point["y"]), float(point["z"])], dtype=np.float64)

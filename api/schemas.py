@@ -49,9 +49,11 @@ class WatermelonTarget(BaseModel):
     center_base_m: Point3D
     axes_m: dict[str, float]
     volume: VolumeResult
+    predicted_weight_kg: float
     grasp: GraspResult
     grasp_mode: str = "injection"
     robot_command: dict[str, object] = Field(default_factory=dict)
+    dual_arm_plan: dict[str, object] = Field(default_factory=dict)
 
 
 class BestTargetResponse(BaseModel):

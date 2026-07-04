@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-origin-base", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--robot-distance-norm", type=float, default=1.5)
     parser.add_argument("--same-height-band", type=float, default=0.08)
-    parser.add_argument("--grasp-mode", choices=("injection", "visible"), default="injection")
+    parser.add_argument("--grasp-mode", choices=("injection",), default="injection")
     parser.add_argument("--tool-normal-base", type=float, nargs=3, default=(0.0, 0.0, 1.0))
     parser.add_argument("--robot-config", default="configs/injection_robot.yaml")
     parser.add_argument("--max-frames", type=int, default=0)
@@ -91,13 +91,14 @@ def draw_debug(
     target = result.get("target")
     if target:
         volume = target["volume"]["volume_liter"]
+        weight = target.get("predicted_weight_kg", 0.0)
         grasp_score = target["grasp_confidence"]
-        target_score = target.get("target_selection_score", 0.0)
         method = target.get("grasp", {}).get("method", "unknown")
         command_count = target.get("robot_command", {}).get("register_count", 0)
-        cv2.putText(overlay, f"volume: {volume:.2f} L  grasp: {grasp_score:.2f}  target: {target_score:.2f}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        plan_type = target.get("dual_arm_plan", {}).get("plan_type", "unknown")
+        cv2.putText(overlay, f"volume: {volume:.2f} L  weight: {weight:.2f}kg  grasp: {grasp_score:.2f}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
         cv2.putText(overlay, f"method: {method}", (16, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        cv2.putText(overlay, f"plc values: {command_count}", (16, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(overlay, f"plan: {plan_type}  plc values: {command_count}", (16, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     elif result.get("message"):
         cv2.putText(overlay, str(result["message"])[:80], (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
@@ -131,6 +132,7 @@ def main() -> None:
         grasp_mode=args.grasp_mode,
         tool_normal_base=tuple(args.tool_normal_base),
         robot_command_builder=robot_command_builder,
+        robot_config=robot_config,
     )
     camera = OrbbecCamera(
         args.width,

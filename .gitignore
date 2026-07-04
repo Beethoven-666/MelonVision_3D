@@ -10,7 +10,6 @@ env/
 # Runtime outputs
 outputs/
 Log/
-text/Log/
 data/raw/
 data/labeled/
 point_clouds/
