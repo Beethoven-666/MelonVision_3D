@@ -35,6 +35,10 @@ class GraspResult(BaseModel):
     score_breakdown: dict[str, float] = Field(default_factory=dict)
     method: str = "unknown"
     is_inferred: bool = False
+    orientation_enabled: bool = False
+    orientation_axis: Optional[str] = None
+    orientation_angle_deg: Optional[float] = None
+    orientation_was_clipped: bool = False
 
 
 class WatermelonTarget(BaseModel):

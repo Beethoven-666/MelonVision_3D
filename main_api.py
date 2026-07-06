@@ -3,19 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from threading import Thread
+from threading import Event, Thread
 from typing import Any
 
+import cv2
 import uvicorn
 
-from api.server import update_latest_result
+from api.server import update_latest_frame_jpeg, update_latest_result
 from calibration.transform import load_transform_from_yaml
-from camera.orbbec_camera import OrbbecCamera
+from camera.rgbd_stream_worker import RGBDStreamWorker
 from perception.watermelon_pipeline import WatermelonVisionProcessor
 from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
 from robot.modbus_tcp_client import write_holding_registers
 
-
+#监控看板：http://127.0.0.1:8000/dashboard
+#启动命令：python .\main_api.py --write-modbus --modbus-host 192.168.1.88 --modbus-start-address 0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Watermelon Vision FastAPI service.")
     parser.add_argument("--host", default="0.0.0.0")
@@ -27,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hw-d2c", action="store_true")
     parser.add_argument("--startup-timeout-ms", type=int, default=10000)
     parser.add_argument("--frame-timeout-ms", type=int, default=2000)
+    parser.add_argument("--camera-restart-timeouts", type=int, default=10)
+    parser.add_argument("--camera-restart-wait-sec", type=float, default=2.0)
     parser.add_argument("--no-full-frame-require", action="store_true")
     parser.add_argument("--transform", default="configs/T_base_camera.yaml")
     parser.add_argument("--camera-id", default="gemini_435le_01")
@@ -47,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loop-sleep", type=float, default=0.02)
     parser.add_argument("--print-interval", type=float, default=1.0, help="Seconds between console result prints.")
     parser.add_argument("--print-json", action="store_true", help="Print the full latest result as JSON.")
+    parser.add_argument("--dashboard-jpeg-quality", type=int, default=82)
+    parser.add_argument("--dashboard-fps", type=float, default=20.0)
+    parser.add_argument("--no-dashboard-frame", action="store_true", help="Disable RGB frame publishing for /dashboard.")
     parser.add_argument(
         "--no-print-result",
         dest="print_result",
@@ -73,13 +80,16 @@ def perception_loop(args: argparse.Namespace) -> None:
         robot_command_builder=robot_command_builder,
         robot_config=robot_config,
     )
-    camera = OrbbecCamera(
-        args.width,
-        args.height,
-        args.fps,
+    stream = RGBDStreamWorker(
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
         use_hw_d2c=args.hw_d2c,
         full_frame_require=not args.no_full_frame_require,
         startup_timeout_ms=args.startup_timeout_ms,
+        frame_timeout_ms=args.frame_timeout_ms,
+        restart_after_timeouts=args.camera_restart_timeouts,
+        restart_wait_sec=args.camera_restart_wait_sec,
     )
     print_state = {
         "last_print_time": 0.0,
@@ -87,30 +97,40 @@ def perception_loop(args: argparse.Namespace) -> None:
     }
 
     try:
-        camera.start()
-        intrinsic = camera.get_color_intrinsic()
+        stream.start()
+        stop_event = Event()
+        dashboard_worker: Thread | None = None
+        if not args.no_dashboard_frame:
+            dashboard_worker = Thread(
+                target=_dashboard_frame_loop,
+                args=(stream, args.dashboard_jpeg_quality, args.dashboard_fps, stop_event),
+                daemon=True,
+            )
+            dashboard_worker.start()
         if args.print_result:
             print(
                 "[INFO] Console perception output is enabled. "
                 "Use --print-json for full JSON or --no-print-result to disable it.",
                 flush=True,
             )
+        last_sequence = 0
         while True:
-            color_bgr, depth_mm, _timestamp = camera.get_rgbd(args.frame_timeout_ms)
-            if color_bgr is None or depth_mm is None:
-                result = {
-                    "status": "camera_error",
-                    "timestamp": time.time(),
-                    "camera_id": args.camera_id,
-                    "target": None,
-                    "message": "No valid RGB-D frame was received.",
-                }
+            frame = stream.get_latest()
+            intrinsic = stream.get_color_intrinsic()
+            if frame is None or intrinsic is None:
+                status = stream.get_status()
+                result = _camera_status_result(args, status)
                 update_latest_result(result)
                 _print_result_if_needed(args, result, print_state)
                 time.sleep(args.loop_sleep)
                 continue
 
-            result, _debug = processor.process(color_bgr, depth_mm, intrinsic)
+            if frame.sequence == last_sequence:
+                time.sleep(args.loop_sleep)
+                continue
+            last_sequence = frame.sequence
+
+            result, _debug = processor.process(frame.color_bgr, frame.depth_mm, intrinsic)
             if args.write_modbus and result.get("target"):
                 _write_robot_command_to_plc(args, robot_config, result)
             update_latest_result(result)
@@ -128,7 +148,11 @@ def perception_loop(args: argparse.Namespace) -> None:
         _print_result_if_needed(args, result, print_state)
         raise
     finally:
-        camera.stop()
+        if "stop_event" in locals():
+            stop_event.set()
+        if "dashboard_worker" in locals() and dashboard_worker is not None:
+            dashboard_worker.join(timeout=1.5)
+        stream.stop()
 
 
 def main() -> None:
@@ -148,7 +172,7 @@ def _write_robot_command_to_plc(args: argparse.Namespace, robot_config: dict, re
     modbus_cfg = robot_config.get("modbus_tcp", {})
     register_cfg = robot_config.get("plc_registers", {})
     #确定 PLC IP 地址。命令行优先，其次 YAML，最后默认 192.168.1.10
-    host = args.modbus_host or modbus_cfg.get("host", "192.168.1.10")
+    host = args.modbus_host or modbus_cfg.get("host", "192.168.1.88")
     #确定 Modbus TCP 端口，默认 502
     port = int(args.modbus_port or modbus_cfg.get("port", 502))
     unit_id = int(args.modbus_unit_id or modbus_cfg.get("unit_id", 1))
@@ -164,6 +188,41 @@ def _write_robot_command_to_plc(args: argparse.Namespace, robot_config: dict, re
         start_address=start_address,
         values=values,
     )
+
+
+def _update_dashboard_frame(color_bgr, jpeg_quality: int) -> None:
+    quality = int(max(35, min(jpeg_quality, 95)))
+    ok, encoded = cv2.imencode(".jpg", color_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if ok:
+        update_latest_frame_jpeg(encoded.tobytes(), time.time())
+
+
+def _dashboard_frame_loop(
+    stream: RGBDStreamWorker,
+    jpeg_quality: int,
+    dashboard_fps: float,
+    stop_event: Event,
+) -> None:
+    interval = 1.0 / max(float(dashboard_fps), 0.1)
+    last_sequence = 0
+    while not stop_event.is_set():
+        frame = stream.get_latest()
+        if frame is not None and frame.sequence != last_sequence:
+            last_sequence = frame.sequence
+            _update_dashboard_frame(frame.color_bgr, jpeg_quality)
+        stop_event.wait(interval)
+
+
+def _camera_status_result(args: argparse.Namespace, status: dict[str, Any]) -> dict[str, Any]:
+    state = status.get("state", "camera_error")
+    return {
+        "status": "camera_error" if state in {"camera_error", "timeout", "restarting"} else "camera_starting",
+        "timestamp": time.time(),
+        "camera_id": args.camera_id,
+        "target": None,
+        "message": str(status.get("message", "No valid RGB-D frame is available.")),
+        "camera_stream": status,
+    }
 
 
 def _print_result_if_needed(
@@ -242,9 +301,13 @@ def _format_result_summary(result: dict[str, Any]) -> str:
         ),
     ]
 
-    axis_text = _format_axis_positions(command.get("axis_values") or {})
+    orientation_text = _format_orientation_axes(command)
+    if orientation_text:
+        lines.append(f"  {orientation_text}")
+
+    axis_text = _format_axis_positions(command.get("axis_values") or {}, command.get("axis_order") or [])
     if axis_text:
-        lines.append(f"  axis_positions_mm {axis_text}")
+        lines.append(f"  axis_positions {axis_text}")
 
     arm_text = _format_arm_assignments(command.get("arm_assignments") or {})
     if arm_text:
@@ -267,14 +330,32 @@ def _format_point(point: Any) -> str:
     )
 
 
-def _format_axis_positions(axis_values: dict[str, Any]) -> str:
+def _format_axis_positions(axis_values: dict[str, Any], axis_order: list[str]) -> str:
     parts = []
-    for axis in ("x", "y1", "y2", "z1", "z2"):
+    ordered_axes = axis_order or list(axis_values.keys())
+    for axis in ordered_axes:
         values = axis_values.get(axis)
         if not isinstance(values, dict):
             continue
-        parts.append(f"{axis}={float(values.get('position_mm', 0.0)):.1f}")
+        if "position_deg" in values:
+            parts.append(f"{axis}={float(values.get('position_deg', 0.0)):.2f}deg")
+        else:
+            parts.append(f"{axis}={float(values.get('position_mm', 0.0)):.1f}mm")
     return " ".join(parts)
+
+
+def _format_orientation_axes(command: dict[str, Any]) -> str:
+    if not command.get("orientation_enabled", False):
+        return "orientation enabled=False"
+    axes = command.get("orientation_axes") or {}
+    parts = []
+    for axis in ("r1", "r2"):
+        info = axes.get(axis) or {}
+        angle = float(info.get("angle_deg", 0.0))
+        state = "enabled" if info.get("enabled", False) else "idle"
+        clipped = " clipped=True" if info.get("was_clipped", False) else ""
+        parts.append(f"{axis}={angle:.2f}deg({state}{clipped})")
+    return "orientation enabled=True " + " ".join(parts)
 
 
 def _format_arm_assignments(assignments: dict[str, Any]) -> str:
@@ -287,9 +368,15 @@ def _format_arm_assignments(assignments: dict[str, Any]) -> str:
         target_id = assignment.get("target_id")
         method = assignment.get("method", "unknown")
         contact = assignment.get("contact_point_mm")
+        orientation_angle = assignment.get("orientation_angle_deg")
+        orientation_text = (
+            f"{float(orientation_angle):.2f}deg"
+            if orientation_angle is not None
+            else "None"
+        )
         parts.append(
             f"{arm_id}(enabled={enabled}, target={target_id}, method={method}, "
-            f"contact_mm={_format_point(contact)})"
+            f"contact_mm={_format_point(contact)}, orientation={orientation_text})"
         )
     return "; ".join(parts)
 

@@ -74,10 +74,46 @@ motion_profile:
     velocity_mm_s: 200.0
     acceleration_mm_s2: 800.0
     jerk_mm_s3: 4000.0
+  r1:
+    velocity_deg_s: 90.0
+    acceleration_deg_s2: 180.0
+    jerk_deg_s3: 500.0
+  r2:
+    velocity_deg_s: 90.0
+    acceleration_deg_s2: 180.0
+    jerk_deg_s3: 500.0
+
+orientation_axes:
+  # Keep false until PLC register mapping and suction-cup servo zero positions are verified.
+  enabled: false
+  axis_order_when_enabled: [x, y1, y2, z1, z2, r1, r2]
+  unit: deg
+
+  r1:
+    enabled: true
+    source_arm: arm1
+    rotation_axis_base: [0.0, 0.0, 1.0]
+    zero_direction_base: [1.0, 0.0, 0.0]
+    angle_offset_deg: 0.0
+    min_deg: -90.0
+    max_deg: 90.0
+    idle_deg: 0.0
+
+  r2:
+    enabled: true
+    source_arm: arm2
+    rotation_axis_base: [0.0, 0.0, 1.0]
+    zero_direction_base: [1.0, 0.0, 0.0]
+    angle_offset_deg: 0.0
+    min_deg: -90.0
+    max_deg: 90.0
+    idle_deg: 0.0
 
 plc_registers:
   start_address: 0
   scale: 10.0
+  linear_scale: 10.0
+  angular_scale: 100.0
   round_digits: 0
   write_order: axis_major
 

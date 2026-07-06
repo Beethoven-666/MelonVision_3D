@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 
 from calibration.transform import load_transform_from_yaml
-from camera.orbbec_camera import OrbbecCamera, list_orbbec_devices
+from camera.orbbec_camera import list_orbbec_devices
+from camera.rgbd_stream_worker import RGBDStreamWorker
 from perception.watermelon_pipeline import WatermelonVisionProcessor
 from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
 from scripts.test_camera import depth_to_colormap
@@ -21,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hw-d2c", action="store_true")
     parser.add_argument("--startup-timeout-ms", type=int, default=10000)
     parser.add_argument("--frame-timeout-ms", type=int, default=2000)
+    parser.add_argument("--camera-restart-timeouts", type=int, default=10)
+    parser.add_argument("--camera-restart-wait-sec", type=float, default=2.0)
     parser.add_argument("--no-full-frame-require", action="store_true")
     parser.add_argument("--transform", default="configs/T_base_camera.yaml")
     parser.add_argument("--camera-id", default="gemini_435le_01")
@@ -94,11 +97,13 @@ def draw_debug(
         weight = target.get("predicted_weight_kg", 0.0)
         grasp_score = target["grasp_confidence"]
         method = target.get("grasp", {}).get("method", "unknown")
-        command_count = target.get("robot_command", {}).get("register_count", 0)
+        command = target.get("robot_command", {})
+        command_count = command.get("register_count", 0)
         plan_type = target.get("dual_arm_plan", {}).get("plan_type", "unknown")
         cv2.putText(overlay, f"volume: {volume:.2f} L  weight: {weight:.2f}kg  grasp: {grasp_score:.2f}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
         cv2.putText(overlay, f"method: {method}", (16, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
         cv2.putText(overlay, f"plan: {plan_type}  plc values: {command_count}", (16, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(overlay, _orientation_text(command), (16, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     elif result.get("message"):
         cv2.putText(overlay, str(result["message"])[:80], (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
@@ -109,6 +114,20 @@ def draw_debug(
     else:
         mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     return np.hstack([overlay, depth_vis, mask_vis])
+
+
+def _orientation_text(command: dict) -> str:
+    if not command.get("orientation_enabled", False):
+        return "orientation: off"
+    axes = command.get("orientation_axes") or {}
+    parts = []
+    for axis in ("r1", "r2"):
+        info = axes.get(axis) or {}
+        angle = float(info.get("angle_deg", 0.0))
+        state = "on" if info.get("enabled", False) else "idle"
+        clipped = " clipped" if info.get("was_clipped", False) else ""
+        parts.append(f"{axis}={angle:.1f}deg({state}{clipped})")
+    return "orientation: " + " ".join(parts)
 
 
 def main() -> None:
@@ -134,44 +153,65 @@ def main() -> None:
         robot_command_builder=robot_command_builder,
         robot_config=robot_config,
     )
-    camera = OrbbecCamera(
-        args.width,
-        args.height,
-        args.fps,
+    stream = RGBDStreamWorker(
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
         use_hw_d2c=args.hw_d2c,
         full_frame_require=not args.no_full_frame_require,
         startup_timeout_ms=args.startup_timeout_ms,
+        frame_timeout_ms=args.frame_timeout_ms,
+        restart_after_timeouts=args.camera_restart_timeouts,
+        restart_wait_sec=args.camera_restart_wait_sec,
     )
+    frame_count = 0
+    last_sequence = 0
+    last_status_print = 0.0
+
     try:
         print("[INFO] Starting RGB-D stream...")
-        camera.start()
-    except Exception as exc:
-        print(f"[ERROR] Failed to start Orbbec camera: {exc}")
-        return
-    frame_count = 0
-
-    try:
-        intrinsic = camera.get_color_intrinsic()
+        stream.start()
         print("Press q or Esc to exit.")
         while True:
-            color_bgr, depth_mm, _timestamp = camera.get_rgbd(args.frame_timeout_ms)
-            if color_bgr is None or depth_mm is None:
+            frame = stream.get_latest()
+            intrinsic = stream.get_color_intrinsic()
+            if frame is None or intrinsic is None:
+                last_status_print = _print_stream_status_periodically(stream, last_status_print)
+                if cv2.waitKey(20) & 0xFF in (ord("q"), 27):
+                    break
                 continue
+            if frame.sequence == last_sequence:
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
+                continue
+            last_sequence = frame.sequence
 
             frame_count += 1
-            result, debug = processor.process(color_bgr, depth_mm, intrinsic)
+            result, debug = processor.process(frame.color_bgr, frame.depth_mm, intrinsic)
             if args.print_json and result.get("status") == "ok":
                 print(json.dumps(result, ensure_ascii=False))
 
-            cv2.imshow("Watermelon Vision Debug", draw_debug(color_bgr, depth_mm, result, debug, intrinsic))
+            cv2.imshow(
+                "Watermelon Vision Debug",
+                draw_debug(frame.color_bgr, frame.depth_mm, result, debug, intrinsic),
+            )
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if args.max_frames > 0 and frame_count >= args.max_frames:
                 break
     finally:
-        camera.stop()
+        stream.stop()
         cv2.destroyAllWindows()
+
+
+def _print_stream_status_periodically(stream: RGBDStreamWorker, last_print_time: float) -> float:
+    now = cv2.getTickCount() / cv2.getTickFrequency()
+    if now - last_print_time < 2.0:
+        return last_print_time
+    status = stream.get_status()
+    print(f"[WARN] RGB-D stream status={status.get('state')} message={status.get('message')}")
+    return now
 
 
 if __name__ == "__main__":

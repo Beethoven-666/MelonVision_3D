@@ -182,6 +182,8 @@ class DualArmInjectionPlanner:
         grasp: dict[str, Any],
     ) -> dict[str, Any]:
         contact_base = self.transform.point_camera_to_base(grasp["contact_point_camera"])
+        normal_base = self.transform.vector_camera_to_base(grasp["surface_normal_camera"])
+        approach_base = -normal_base
         return make_arm_assignment(
             arm_id=arm_id,
             contact_point_base_m=contact_base,
@@ -190,6 +192,8 @@ class DualArmInjectionPlanner:
             score=float(grasp.get("score", 0.0)),
             is_inferred=bool(grasp.get("is_inferred", False)),
             weight_kg=float(candidate["predicted_weight_kg"]),
+            surface_normal_base=normal_base,
+            approach_vector_base=approach_base,
         )
 
     def _plan_result(
@@ -209,15 +213,16 @@ class DualArmInjectionPlanner:
             }
             for candidate in selected_targets
         ]
+        orientation_by_arm = self._orientation_by_arm(command)
         result = {
             "plan_type": plan_type,
             "robot_command": command,
             "selected_targets": target_summaries,
             "arm_grasps": {
-                arm_id: self._grasp_summary(grasp)
+                arm_id: self._grasp_summary(arm_id, grasp, orientation_by_arm.get(arm_id))
                 for arm_id, grasp in arm_grasps.items()
             },
-            "primary_grasp": self._primary_grasp(arm_grasps),
+            "primary_grasp": self._primary_grasp(arm_grasps, orientation_by_arm),
             "planning_config": {
                 "density_kg_per_liter": self._density_kg_per_liter(),
                 "dual_arm_weight_threshold_kg": self._dual_arm_weight_threshold_kg(),
@@ -228,30 +233,59 @@ class DualArmInjectionPlanner:
             result.update(extra)
         return result
 
-    def _grasp_summary(self, grasp: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _grasp_summary(
+        self,
+        arm_id: str,
+        grasp: dict[str, Any] | None,
+        orientation: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         if grasp is None:
             return None
         contact_base = self.transform.point_camera_to_base(grasp["contact_point_camera"])
         normal_base = self.transform.vector_camera_to_base(grasp["surface_normal_camera"])
+        approach_base = -normal_base
         pregrasp_base = self.transform.point_camera_to_base(grasp["pregrasp_point_camera"])
+        orientation_enabled = bool(orientation.get("enabled", False)) if orientation else False
         return {
+            "arm_id": arm_id,
             "method": grasp.get("method", "unknown"),
             "score": float(grasp.get("score", 0.0)),
             "is_inferred": bool(grasp.get("is_inferred", False)),
             "score_breakdown": grasp.get("score_breakdown", {}),
             "contact_point_base_m": _point_dict(contact_base),
             "surface_normal_base": _point_dict(normal_base),
+            "approach_vector_base": _point_dict(approach_base),
             "pregrasp_point_base_m": _point_dict(pregrasp_base),
+            "orientation_enabled": orientation_enabled,
+            "orientation_axis": orientation.get("axis") if orientation else None,
+            "orientation_angle_deg": (
+                float(orientation["angle_deg"]) if orientation_enabled and orientation else None
+            ),
+            "orientation_was_clipped": bool(orientation.get("was_clipped", False)) if orientation else False,
         }
 
-    def _primary_grasp(self, arm_grasps: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+    def _primary_grasp(
+        self,
+        arm_grasps: dict[str, dict[str, Any] | None],
+        orientation_by_arm: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         for arm_id in ("arm1", "arm2"):
             grasp = arm_grasps.get(arm_id)
-            summary = self._grasp_summary(grasp)
+            summary = self._grasp_summary(arm_id, grasp, orientation_by_arm.get(arm_id))
             if summary is not None:
-                summary["arm_id"] = arm_id
                 return summary
         raise ValueError("No primary grasp is available.")
+
+    @staticmethod
+    def _orientation_by_arm(command: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        by_arm: dict[str, dict[str, Any]] = {}
+        for orientation in (command.get("orientation_axes") or {}).values():
+            if not isinstance(orientation, dict):
+                continue
+            source_arm = orientation.get("source_arm")
+            if source_arm:
+                by_arm[str(source_arm)] = orientation
+        return by_arm
 
     def _density_kg_per_liter(self) -> float:
         return float(self.planning.get("density_kg_per_liter", 0.95))
