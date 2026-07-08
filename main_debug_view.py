@@ -9,6 +9,7 @@ import numpy as np
 from calibration.transform import load_transform_from_yaml
 from camera.orbbec_camera import list_orbbec_devices
 from camera.rgbd_stream_worker import RGBDStreamWorker
+from perception.segmenter_factory import add_segmenter_args, build_segmenter_from_args
 from perception.watermelon_pipeline import WatermelonVisionProcessor
 from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
 from scripts.test_camera import depth_to_colormap
@@ -34,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grasp-mode", choices=("injection",), default="injection")
     parser.add_argument("--tool-normal-base", type=float, nargs=3, default=(0.0, 0.0, 1.0))
     parser.add_argument("--robot-config", default="configs/injection_robot.yaml")
+    add_segmenter_args(parser)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--print-json", action="store_true")
     return parser.parse_args()
@@ -141,6 +143,7 @@ def main() -> None:
     transform = load_transform_from_yaml(args.transform)
     robot_config = load_injection_robot_config(args.robot_config)
     robot_command_builder = InjectionRobotCommandBuilder(robot_config)
+    segmenter = build_segmenter_from_args(args)
     processor = WatermelonVisionProcessor(
         transform=transform,
         camera_id=args.camera_id,
@@ -152,6 +155,7 @@ def main() -> None:
         tool_normal_base=tuple(args.tool_normal_base),
         robot_command_builder=robot_command_builder,
         robot_config=robot_config,
+        segmenter=segmenter,
     )
     stream = RGBDStreamWorker(
         width=args.width,

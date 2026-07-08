@@ -12,6 +12,7 @@ import uvicorn
 from api.server import update_latest_frame_jpeg, update_latest_result
 from calibration.transform import load_transform_from_yaml
 from camera.rgbd_stream_worker import RGBDStreamWorker
+from perception.segmenter_factory import add_segmenter_args, build_segmenter_from_args
 from perception.watermelon_pipeline import WatermelonVisionProcessor
 from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
 from robot.modbus_tcp_client import write_holding_registers
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grasp-mode", choices=("injection",), default="injection")
     parser.add_argument("--tool-normal-base", type=float, nargs=3, default=(0.0, 0.0, 1.0))
     parser.add_argument("--robot-config", default="configs/injection_robot.yaml")
+    add_segmenter_args(parser)
     #是否真的把结果写给 PLC。默认不写，避免调试时误动作
     parser.add_argument("--write-modbus", action="store_true", help="Write 20 robot command values to PLC via Modbus TCP.")
     #Modbus TCP 的 IP、端口、设备 ID、起始寄存器地址
@@ -68,6 +70,7 @@ def perception_loop(args: argparse.Namespace) -> None:
     transform = load_transform_from_yaml(args.transform)
     robot_config = load_injection_robot_config(args.robot_config)
     robot_command_builder = InjectionRobotCommandBuilder(robot_config)
+    segmenter = build_segmenter_from_args(args)
     processor = WatermelonVisionProcessor(
         transform=transform,
         camera_id=args.camera_id,
@@ -79,6 +82,7 @@ def perception_loop(args: argparse.Namespace) -> None:
         tool_normal_base=tuple(args.tool_normal_base),
         robot_command_builder=robot_command_builder,
         robot_config=robot_config,
+        segmenter=segmenter,
     )
     stream = RGBDStreamWorker(
         width=args.width,

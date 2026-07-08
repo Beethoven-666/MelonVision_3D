@@ -17,9 +17,25 @@ from camera.orbbec_camera import OrbbecCamera
 from scripts.test_camera import depth_to_colormap
 
 
+def get_next_index(output_dir: Path) -> int:
+    indices = []
+    for path in output_dir.glob("color_*.png"):
+        try:
+            indices.append(int(path.stem.rsplit("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max(indices, default=0) + 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Capture RGB-D dataset frames from an Orbbec camera.")
     parser.add_argument("--output-dir", default="data/raw")
+    parser.add_argument(
+        "--interval-sec",
+        type=float,
+        default=5.0,
+        help="Automatically save one frame every N seconds. Set to 0 to disable auto capture.",
+    )
     parser.add_argument("--width", type=int, default=0)
     parser.add_argument("--height", type=int, default=0)
     parser.add_argument("--fps", type=int, default=0)
@@ -34,6 +50,9 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    auto_capture_enabled = args.interval_sec > 0
+    next_capture_time = time.monotonic() + args.interval_sec if auto_capture_enabled else float("inf")
+
     camera = OrbbecCamera(
         args.width,
         args.height,
@@ -43,10 +62,14 @@ def main() -> None:
         startup_timeout_ms=args.startup_timeout_ms,
     )
     camera.start()
-    index = 1
+    index = get_next_index(output_dir)
 
     try:
-        print("Press s to save a frame, q or Esc to exit.")
+        if auto_capture_enabled:
+            print(f"Auto capture enabled: saving one frame every {args.interval_sec:.1f}s.")
+        else:
+            print("Auto capture disabled.")
+        print("Press s to save an extra frame, q or Esc to exit.")
         while True:
             color_bgr, depth_mm, timestamp = camera.get_rgbd(args.frame_timeout_ms)
             if color_bgr is None or depth_mm is None:
@@ -57,7 +80,10 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key != ord("s"):
+
+            now = time.monotonic()
+            should_save = key == ord("s") or now >= next_capture_time
+            if not should_save:
                 continue
 
             stem = f"{index:06d}"
@@ -76,6 +102,8 @@ def main() -> None:
             )
             print(f"Saved frame {stem} to {output_dir}")
             index += 1
+            if auto_capture_enabled:
+                next_capture_time = now + args.interval_sec
     finally:
         camera.stop()
         cv2.destroyAllWindows()
