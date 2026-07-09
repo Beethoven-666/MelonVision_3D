@@ -145,9 +145,11 @@ def update_latest_frame_jpeg(frame_jpeg: bytes, timestamp: float | None = None) 
 
 
 def _watermelon_summary(target: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    targets = _watermelon_target_summaries(target, plan)
     if not target:
         return {
             "detected": False,
+            "detected_count": 0,
             "track_id": None,
             "class_name": None,
             "confidence": 0.0,
@@ -155,11 +157,13 @@ def _watermelon_summary(target: dict[str, Any], plan: dict[str, Any]) -> dict[st
             "volume_liter": 0.0,
             "center_base_m": None,
             "grasp": None,
+            "targets": [],
             "selected_targets": [],
         }
     volume = target.get("volume") or {}
     return {
         "detected": True,
+        "detected_count": len(targets) if targets else 1,
         "track_id": target.get("track_id"),
         "class_name": target.get("class_name"),
         "confidence": target.get("detection_confidence", 0.0),
@@ -169,8 +173,130 @@ def _watermelon_summary(target: dict[str, Any], plan: dict[str, Any]) -> dict[st
         "volume_liter": volume.get("volume_liter", 0.0),
         "center_base_m": target.get("center_base_m"),
         "grasp": target.get("grasp"),
+        "targets": targets,
         "selected_targets": plan.get("selected_targets", []),
     }
+
+
+def _watermelon_target_summaries(target: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
+    if not target:
+        return []
+
+    raw_targets = target.get("dashboard_targets") or []
+    if raw_targets:
+        normalized = [_normalize_dashboard_target(item, plan) for item in raw_targets if isinstance(item, dict)]
+        return _visible_task_targets(normalized)
+
+    selected_targets = plan.get("selected_targets") or []
+    if selected_targets:
+        return [_normalize_plan_target(item, target, plan) for item in selected_targets if isinstance(item, dict)]
+
+    return [_primary_target_summary(target, plan)]
+
+
+def _visible_task_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not targets:
+        return []
+    selected = [item for item in targets if item.get("selected")]
+    waiting = [item for item in targets if not item.get("selected")]
+    if len(selected) >= 2:
+        return selected[:2]
+    if len(selected) == 1:
+        return selected + waiting[:1]
+    return targets[:2]
+
+
+def _normalize_dashboard_target(item: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    target_id = _safe_int(item.get("target_id"))
+    primary_target_id = _safe_int(plan.get("primary_target_id"))
+    arm_id = item.get("arm_id") or _arm_id_for_target(plan, target_id)
+    return {
+        "target_id": target_id,
+        "label": item.get("label") or _target_label(target_id, arm_id),
+        "selected": bool(item.get("selected", False)),
+        "primary": bool(item.get("primary", primary_target_id is not None and target_id == primary_target_id)),
+        "arm_id": arm_id,
+        "class_name": item.get("class_name"),
+        "confidence": item.get("confidence", 0.0),
+        "grasp_confidence": item.get("grasp_confidence", 0.0),
+        "target_selection_score": item.get("target_selection_score", 0.0),
+        "weight_kg": item.get("weight_kg", 0.0),
+        "volume_liter": item.get("volume_liter", 0.0),
+        "center_base_m": item.get("center_base_m"),
+        "camera_depth_m": item.get("camera_depth_m"),
+        "camera_distance_m": item.get("camera_distance_m"),
+    }
+
+
+def _normalize_plan_target(item: dict[str, Any], target: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    target_id = _safe_int(item.get("target_id"))
+    primary_target_id = _safe_int(plan.get("primary_target_id"))
+    arm_id = _arm_id_for_target(plan, target_id)
+    return {
+        "target_id": target_id,
+        "label": _target_label(target_id, arm_id),
+        "selected": True,
+        "primary": primary_target_id is not None and target_id == primary_target_id,
+        "arm_id": arm_id,
+        "class_name": target.get("class_name"),
+        "confidence": target.get("detection_confidence", 0.0),
+        "grasp_confidence": ((plan.get("arm_grasps") or {}).get(arm_id) or {}).get("score", 0.0) if arm_id else 0.0,
+        "target_selection_score": item.get("target_selection_score", 0.0),
+        "weight_kg": item.get("predicted_weight_kg", 0.0),
+        "volume_liter": item.get("volume_liter", 0.0),
+        "center_base_m": item.get("center_base_m"),
+        "camera_depth_m": item.get("camera_depth_m"),
+        "camera_distance_m": item.get("camera_distance_m"),
+    }
+
+
+def _primary_target_summary(target: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    target_id = _safe_int(plan.get("primary_target_id"))
+    arm_id = _arm_id_for_target(plan, target_id)
+    volume = target.get("volume") or {}
+    return {
+        "target_id": target_id,
+        "label": _target_label(target_id, arm_id),
+        "selected": True,
+        "primary": True,
+        "arm_id": arm_id,
+        "class_name": target.get("class_name"),
+        "confidence": target.get("detection_confidence", 0.0),
+        "grasp_confidence": target.get("grasp_confidence", 0.0),
+        "target_selection_score": target.get("target_selection_score", 0.0),
+        "weight_kg": target.get("predicted_weight_kg", 0.0),
+        "volume_liter": volume.get("volume_liter", 0.0),
+        "center_base_m": target.get("center_base_m"),
+        "camera_depth_m": target.get("camera_depth_m"),
+        "camera_distance_m": target.get("camera_distance_m"),
+    }
+
+
+def _arm_id_for_target(plan: dict[str, Any], target_id: int | None) -> str | None:
+    if target_id is None:
+        return None
+    assignments = ((plan.get("robot_command") or {}).get("arm_assignments") or {})
+    for arm_id, assignment in assignments.items():
+        if not isinstance(assignment, dict) or not assignment.get("enabled", False):
+            continue
+        if _safe_int(assignment.get("target_id")) == target_id:
+            return str(arm_id)
+    return None
+
+
+def _target_label(target_id: int | None, arm_id: str | None) -> str:
+    if target_id is None:
+        return arm_id or "目标"
+    if arm_id:
+        return f"{arm_id} T{target_id}"
+    return f"T{target_id}"
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _planned_grab_count(plan: dict[str, Any], command: dict[str, Any]) -> int:
@@ -203,21 +329,27 @@ DASHBOARD_HTML = r"""<!doctype html>
       --shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
     }
     * { box-sizing: border-box; }
+    html {
+      height: 100%;
+      overflow: hidden;
+    }
     body {
       margin: 0;
+      height: 100%;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
       font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
     }
     header {
-      height: 64px;
+      height: 52px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 24px;
+      padding: 0 18px;
       border-bottom: 1px solid var(--line);
       background: rgba(15, 20, 18, 0.96);
-      position: sticky;
+      position: relative;
       top: 0;
       z-index: 5;
     }
@@ -246,10 +378,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     .dot.warn { background: var(--warn); }
     .dot.bad { background: var(--bad); }
     main {
-      padding: 20px;
+      height: calc(100vh - 52px);
+      padding: 12px;
       display: grid;
       grid-template-columns: minmax(420px, 1.45fr) minmax(360px, 1fr);
-      gap: 18px;
+      gap: 12px;
+      overflow: hidden;
     }
     section {
       background: var(--panel);
@@ -257,19 +391,26 @@ DASHBOARD_HTML = r"""<!doctype html>
       border-radius: 8px;
       box-shadow: var(--shadow);
       overflow: hidden;
+      min-height: 0;
     }
     .section-title {
-      height: 44px;
+      height: 36px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 14px;
+      padding: 0 12px;
       border-bottom: 1px solid var(--line);
       color: var(--muted);
       font-size: 13px;
     }
+    .camera-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
     .video {
-      min-height: 420px;
+      flex: 1 1 auto;
+      min-height: 0;
       background: #070a09;
       display: flex;
       align-items: center;
@@ -279,7 +420,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .video img {
       width: 100%;
       height: 100%;
-      max-height: calc(100vh - 160px);
+      max-height: none;
       object-fit: contain;
       display: block;
     }
@@ -292,14 +433,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     .grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      padding: 14px;
+      gap: 8px;
+      padding: 10px;
       background: var(--panel-2);
       border-top: 1px solid var(--line);
+      flex: 0 0 auto;
     }
     .metric {
-      min-height: 74px;
-      padding: 10px 12px;
+      min-height: 60px;
+      padding: 8px 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: rgba(255,255,255,0.025);
@@ -308,28 +450,42 @@ DASHBOARD_HTML = r"""<!doctype html>
       display: block;
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .metric strong {
       display: block;
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 650;
       line-height: 1.05;
+      white-space: pre-line;
+    }
+    .metric strong.compact {
+      font-size: 14px;
+      line-height: 1.25;
     }
     .side {
       display: grid;
-      gap: 18px;
-      align-content: start;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      gap: 12px;
+      align-content: stretch;
+      min-height: 0;
+      overflow: hidden;
     }
-    .content { padding: 14px; }
+    .content { padding: 10px 12px; }
+    .axis-panel {
+      min-height: 0;
+    }
+    .axis-panel .content {
+      overflow: hidden;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 13px;
+      font-size: 12px;
     }
     th, td {
       text-align: right;
-      padding: 9px 8px;
+      padding: 7px 8px;
       border-bottom: 1px solid var(--line);
       white-space: nowrap;
     }
@@ -348,6 +504,52 @@ DASHBOARD_HTML = r"""<!doctype html>
       color: var(--text);
     }
     .kv span:nth-child(odd) { color: var(--muted); }
+    .watermelon-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 0;
+    }
+    .watermelon-list.two-targets {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .target-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.025);
+      padding: 8px;
+      min-width: 0;
+    }
+    .target-card.selected {
+      border-color: rgba(83, 213, 255, 0.58);
+      background: rgba(83, 213, 255, 0.065);
+    }
+    .target-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+    .target-title strong {
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.2;
+    }
+    .target-grid {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 4px 12px;
+      font-size: 12px;
+    }
+    .target-grid span {
+      white-space: nowrap;
+    }
+    .target-grid span:nth-child(odd) { color: var(--muted); }
+    .target-grid span:nth-child(even) {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .mono {
       font-family: Consolas, "Cascadia Mono", monospace;
       font-size: 12px;
@@ -360,11 +562,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       gap: 8px;
       flex-wrap: wrap;
     }
+    .grab-panel .content {
+      height: calc(100% - 36px);
+      display: flex;
+      align-items: center;
+      padding: 18px 20px;
+    }
+    .grab-panel .event-spacer,
+    .grab-panel #events {
+      display: none;
+    }
     button {
       border: 1px solid var(--line);
       background: #223129;
       color: var(--text);
-      height: 34px;
+      height: 32px;
       padding: 0 12px;
       border-radius: 8px;
       cursor: pointer;
@@ -375,6 +587,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       border-color: #31945f;
     }
     button:hover { filter: brightness(1.1); }
+    .grab-panel .buttons {
+      gap: 14px;
+    }
+    .grab-panel button {
+      height: 42px;
+      padding: 0 20px;
+      font-size: 16px;
+    }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -389,7 +609,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     .badge.warn { color: var(--warn); }
     .badge.bad { color: var(--bad); }
     @media (max-width: 980px) {
-      main { grid-template-columns: 1fr; padding: 12px; }
+      html, body { overflow: auto; }
+      main { height: auto; grid-template-columns: 1fr; padding: 12px; overflow: visible; }
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       header { padding: 0 14px; }
       .top-status { display: none; }
@@ -402,11 +623,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="top-status"><span id="status-dot" class="dot"></span><span id="status-text">连接中</span><span id="clock"></span></div>
   </header>
   <main>
-    <section>
-      <div class="section-title"><span>RGB 实时画面</span><span id="frame-time" class="badge">无画面</span></div>
+    <section class="camera-panel">
+      <div class="section-title"><span>调试实时画面</span><span id="frame-time" class="badge">无画面</span></div>
       <div class="video">
-        <img id="rgb" alt="RGB camera frame" />
-        <div id="no-frame" class="placeholder">等待相机 RGB 图像</div>
+        <img id="rgb" alt="Debug camera frame" />
+        <div id="no-frame" class="placeholder">等待相机调试图像</div>
       </div>
       <div class="grid">
         <div class="metric"><label>目标状态</label><strong id="target-state">--</strong></div>
@@ -417,12 +638,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
 
     <div class="side">
-      <section>
+      <section class="watermelon-panel">
         <div class="section-title"><span>西瓜状态</span><span id="plan-badge" class="badge">--</span></div>
-        <div class="content kv" id="watermelon-kv"></div>
+        <div class="content">
+          <div class="watermelon-list" id="watermelon-list"></div>
+        </div>
       </section>
 
-      <section>
+      <section class="axis-panel">
         <div class="section-title"><span>机械臂轴状态</span><span id="register-badge" class="badge">0 values</span></div>
         <div class="content">
           <table>
@@ -432,23 +655,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section>
-        <div class="section-title"><span>双臂与 PLC</span><span id="orientation-badge" class="badge">orientation off</span></div>
-        <div class="content">
-          <div class="kv" id="arm-kv"></div>
-          <div style="height:12px"></div>
-          <div class="mono" id="registers"></div>
-        </div>
-      </section>
-
-      <section>
+      <section class="grab-panel">
         <div class="section-title"><span>抓取计数</span><span id="planned-count" class="badge">本次计划 0</span></div>
         <div class="content">
           <div class="buttons">
             <button class="primary" onclick="incrementGrabbed()">记录本次抓取</button>
             <button onclick="resetGrabbed()">重置计数</button>
           </div>
-          <div style="height:12px"></div>
+          <div class="event-spacer" style="height:12px"></div>
           <div class="mono" id="events"></div>
         </div>
       </section>
@@ -458,6 +672,17 @@ DASHBOARD_HTML = r"""<!doctype html>
     const fmt = (v, digits = 3) => Number.isFinite(Number(v)) ? Number(v).toFixed(digits) : "--";
     const point = p => p ? `(${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)})` : "--";
     const setText = (id, value) => { document.getElementById(id).textContent = value; };
+    const setMetric = (id, value, compact = false) => {
+      const el = document.getElementById(id);
+      el.textContent = value;
+      el.classList.toggle("compact", compact);
+    };
+    const escapeHtml = value => String(value ?? "--")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
     let hasRgbFrame = false;
 
     async function fetchState() {
@@ -488,25 +713,26 @@ DASHBOARD_HTML = r"""<!doctype html>
       const wm = data.watermelon || {};
       const robot = data.robot || {};
       const counters = data.counters || {};
+      const targets = normalizedTargets(wm);
+      const taskTargets = visibleTaskTargets(targets);
+      const detectedCount = wm.detected ? (taskTargets.length || 1) : 0;
       const status = cam.status || "unknown";
       const ok = status === "ok";
       const cameraBad = status === "camera_error";
       setTopStatus(ok ? "ok" : cameraBad ? "bad" : "warn", `状态 ${status}`);
       setText("clock", new Date().toLocaleTimeString());
-      setText("target-state", wm.detected ? "已识别" : "无目标");
-      setText("weight", wm.detected ? `${fmt(wm.weight_kg, 2)} kg` : "--");
-      setText("volume", wm.detected ? `${fmt(wm.volume_liter, 2)} L` : "--");
-      setText("grabbed", counters.grabbed_count ?? 0);
+      setMetric("target-state", detectedCount > 0 ? `${detectedCount} 个目标` : "无目标", false);
+      setMetric("weight", wm.detected ? targetMetricSummary(taskTargets, "weight_kg", "kg") : "--", taskTargets.length > 1);
+      setMetric("volume", wm.detected ? targetMetricSummary(taskTargets, "volume_liter", "L") : "--", taskTargets.length > 1);
+      setMetric("grabbed", counters.grabbed_count ?? 0, false);
       setText("planned-count", `本次计划 ${counters.planned_grab_count || 0}`);
       setText("frame-time", cam.last_frame_time ? new Date(cam.last_frame_time * 1000).toLocaleTimeString() : "无画面");
       setText("plan-badge", robot.plan_type || "--");
       setText("register-badge", `${robot.register_count || 0} values`);
-      setText("orientation-badge", robot.orientation_enabled ? "orientation on" : "orientation off");
       hasRgbFrame = Boolean(cam.has_rgb_frame);
       refreshImage();
-      renderWatermelon(wm, cam);
+      renderWatermelon(wm);
       renderAxes(robot);
-      renderArms(robot);
       renderEvents(counters.events || []);
     }
 
@@ -516,20 +742,117 @@ DASHBOARD_HTML = r"""<!doctype html>
       setText("status-text", text);
     }
 
-    function renderWatermelon(wm, cam) {
-      const rows = [
-        ["相机", cam.camera_id || "--"],
-        ["消息", cam.message || "--"],
-        ["Track ID", wm.track_id ?? "--"],
-        ["类别", wm.class_name || "--"],
-        ["检测置信度", fmt(wm.confidence, 3)],
-        ["抓取置信度", fmt(wm.grasp_confidence, 3)],
-        ["目标评分", fmt(wm.target_selection_score, 3)],
-        ["中心 robot_base", point(wm.center_base_m)],
-        ["吸点 robot_base", point((wm.grasp || {}).contact_point_base_m)],
-        ["法向", point((wm.grasp || {}).surface_normal_base)],
-      ];
-      document.getElementById("watermelon-kv").innerHTML = rows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");
+    function renderWatermelon(wm) {
+      renderWatermelonTargets(wm, visibleTaskTargets(normalizedTargets(wm)));
+    }
+
+    function normalizedTargets(wm) {
+      if (Array.isArray(wm.targets) && wm.targets.length) {
+        return wm.targets;
+      }
+      if (Array.isArray(wm.selected_targets) && wm.selected_targets.length) {
+        return wm.selected_targets.map(item => ({
+          target_id: item.target_id,
+          label: item.target_id == null ? "目标" : `T${item.target_id}`,
+          selected: true,
+          primary: false,
+          arm_id: null,
+          class_name: wm.class_name,
+          confidence: wm.confidence,
+          grasp_confidence: wm.grasp_confidence,
+          target_selection_score: item.target_selection_score ?? wm.target_selection_score,
+          weight_kg: item.predicted_weight_kg,
+          volume_liter: item.volume_liter,
+          center_base_m: item.center_base_m,
+          camera_depth_m: item.camera_depth_m,
+          camera_distance_m: item.camera_distance_m,
+        }));
+      }
+      if (wm.detected) {
+        return [{
+          target_id: null,
+          label: "主目标",
+          selected: true,
+          primary: true,
+          arm_id: null,
+          class_name: wm.class_name,
+          confidence: wm.confidence,
+          grasp_confidence: wm.grasp_confidence,
+          target_selection_score: wm.target_selection_score,
+          weight_kg: wm.weight_kg,
+          volume_liter: wm.volume_liter,
+          center_base_m: wm.center_base_m,
+          camera_depth_m: null,
+          camera_distance_m: null,
+        }];
+      }
+      return [];
+    }
+
+    function watermelonName(target, index, targets) {
+      if (targets.length > 1) {
+        return `西瓜${String.fromCharCode(65 + index)}`;
+      }
+      return target.label || "西瓜A";
+    }
+
+    function visibleTaskTargets(targets) {
+      const selected = targets.filter(target => target.selected);
+      const waiting = targets.filter(target => !target.selected);
+      if (selected.length >= 2) {
+        return selected.slice(0, 2);
+      }
+      if (selected.length === 1) {
+        return selected.concat(waiting.slice(0, 1));
+      }
+      return targets.slice(0, 2);
+    }
+
+    function targetMetricSummary(targets, key, unit) {
+      if (!targets.length) {
+        return "--";
+      }
+      if (targets.length === 1) {
+        return `${fmt(targets[0][key], 2)} ${unit}`;
+      }
+      return targets.slice(0, 2)
+        .map((target, index) => `${watermelonName(target, index, targets)} ${fmt(target[key], 2)} ${unit}`)
+        .join("\n");
+    }
+
+    function renderWatermelonTargets(wm, targets) {
+      const list = document.getElementById("watermelon-list");
+      if (!wm.detected || !targets.length) {
+        list.classList.remove("two-targets");
+        list.innerHTML = `<div class="target-card"><div class="target-title"><strong>暂无目标</strong><span class="badge warn">waiting</span></div></div>`;
+        return;
+      }
+      list.classList.toggle("two-targets", targets.length > 1);
+      list.innerHTML = targets.map((target, index) => {
+        const name = watermelonName(target, index, targets);
+        const label = name;
+        const state = target.selected ? "正在抓取" : "等待抓取";
+        const badgeClass = target.selected ? "ok" : "warn";
+        const arm = target.arm_id || "--";
+        const rows = [
+          ["机械臂", arm],
+          ["预测重量", `${fmt(target.weight_kg, 2)} kg`],
+          ["体积", `${fmt(target.volume_liter, 2)} L`],
+          ["抓取置信", fmt(target.grasp_confidence, 3)],
+          ["目标评分", fmt(target.target_selection_score, 3)],
+        ];
+        return `
+          <div class="target-card ${target.selected ? "selected" : ""}">
+            <div class="target-title">
+              <strong>${escapeHtml(label)}</strong>
+              <span class="badge ${badgeClass}">${escapeHtml(state)}</span>
+            </div>
+            <div class="target-grid">
+              ${rows.map(([k, v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(v)}</span>`).join("")}
+            </div>
+          </div>
+        `;
+      }).join("");
     }
 
     function renderAxes(robot) {
@@ -545,21 +868,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         const jerk = angular ? `${fmt(v.jerk_deg_s3, 1)} deg/s3` : `${fmt(v.jerk_mm_s3, 1)} mm/s3`;
         return `<tr><td>${axis}</td><td>${pos}</td><td>${vel}</td><td>${acc}</td><td>${jerk}</td></tr>`;
       }).join("") || `<tr><td colspan="5">暂无机械臂命令</td></tr>`;
-    }
-
-    function renderArms(robot) {
-      const assignments = robot.arm_assignments || {};
-      const rows = [];
-      for (const arm of ["arm1", "arm2"]) {
-        const a = assignments[arm] || {};
-        rows.push([`${arm} 启用`, a.enabled ? "true" : "false"]);
-        rows.push([`${arm} 目标`, a.target_id ?? "--"]);
-        rows.push([`${arm} 吸点 mm`, point(a.contact_point_mm)]);
-        rows.push([`${arm} 旋转角`, a.orientation_angle_deg == null ? "--" : `${fmt(a.orientation_angle_deg, 2)} deg`]);
-      }
-      document.getElementById("arm-kv").innerHTML = rows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");
-      const values = robot.register_values || [];
-      document.getElementById("registers").textContent = values.length ? `PLC registers: [${values.join(", ")}]` : "PLC registers: --";
     }
 
     function renderEvents(events) {

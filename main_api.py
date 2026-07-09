@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from threading import Event, Thread
+from threading import Thread
 from typing import Any
 
 import cv2
@@ -12,6 +12,7 @@ import uvicorn
 from api.server import update_latest_frame_jpeg, update_latest_result
 from calibration.transform import load_transform_from_yaml
 from camera.rgbd_stream_worker import RGBDStreamWorker
+from main_debug_view import draw_debug_overlay
 from perception.segmenter_factory import add_segmenter_args, build_segmenter_from_args
 from perception.watermelon_pipeline import WatermelonVisionProcessor
 from robot.injection_molding_robot import InjectionRobotCommandBuilder, load_injection_robot_config
@@ -55,7 +56,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-json", action="store_true", help="Print the full latest result as JSON.")
     parser.add_argument("--dashboard-jpeg-quality", type=int, default=82)
     parser.add_argument("--dashboard-fps", type=float, default=20.0)
-    parser.add_argument("--no-dashboard-frame", action="store_true", help="Disable RGB frame publishing for /dashboard.")
+    parser.add_argument("--no-dashboard-frame", action="store_true", help="Disable frame publishing for /dashboard.")
+    parser.add_argument(
+        "--dashboard-frame-mode",
+        choices=("debug", "rgb"),
+        default="debug",
+        help="Use debug for the annotated YOLO/debug view, or rgb for the raw color frame.",
+    )
     parser.add_argument(
         "--no-print-result",
         dest="print_result",
@@ -99,18 +106,13 @@ def perception_loop(args: argparse.Namespace) -> None:
         "last_print_time": 0.0,
         "last_signature": None,
     }
+    dashboard_state = {
+        "last_update_time": 0.0,
+        "last_warn_time": 0.0,
+    }
 
     try:
         stream.start()
-        stop_event = Event()
-        dashboard_worker: Thread | None = None
-        if not args.no_dashboard_frame:
-            dashboard_worker = Thread(
-                target=_dashboard_frame_loop,
-                args=(stream, args.dashboard_jpeg_quality, args.dashboard_fps, stop_event),
-                daemon=True,
-            )
-            dashboard_worker.start()
         if args.print_result:
             print(
                 "[INFO] Console perception output is enabled. "
@@ -134,7 +136,18 @@ def perception_loop(args: argparse.Namespace) -> None:
                 continue
             last_sequence = frame.sequence
 
-            result, _debug = processor.process(frame.color_bgr, frame.depth_mm, intrinsic)
+            result, debug = processor.process(frame.color_bgr, frame.depth_mm, intrinsic)
+            _attach_dashboard_targets(result, debug)
+            if not args.no_dashboard_frame:
+                _update_dashboard_frame_if_needed(
+                    args,
+                    frame.color_bgr,
+                    frame.depth_mm,
+                    result,
+                    debug,
+                    intrinsic,
+                    dashboard_state,
+                )
             if args.write_modbus and result.get("target"):
                 _write_robot_command_to_plc(args, robot_config, result)
             update_latest_result(result)
@@ -152,10 +165,6 @@ def perception_loop(args: argparse.Namespace) -> None:
         _print_result_if_needed(args, result, print_state)
         raise
     finally:
-        if "stop_event" in locals():
-            stop_event.set()
-        if "dashboard_worker" in locals() and dashboard_worker is not None:
-            dashboard_worker.join(timeout=1.5)
         stream.stop()
 
 
@@ -194,6 +203,93 @@ def _write_robot_command_to_plc(args: argparse.Namespace, robot_config: dict, re
     )
 
 
+def _attach_dashboard_targets(result: dict[str, Any], debug: dict[str, Any]) -> None:
+    target = result.get("target")
+    if not isinstance(target, dict):
+        return
+
+    candidates = debug.get("target_candidates") or []
+    if not candidates:
+        return
+
+    plan = target.get("dual_arm_plan") or {}
+    selected_ids = {
+        target_id
+        for item in plan.get("selected_targets", [])
+        if isinstance(item, dict) and (target_id := _safe_int(item.get("target_id"))) is not None
+    }
+    primary_target_id = _safe_int(plan.get("primary_target_id"))
+    arm_by_target = _arm_by_target((target.get("robot_command") or {}).get("arm_assignments") or {})
+
+    dashboard_targets = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        target_id = _safe_int(candidate.get("target_id"))
+        detection = candidate.get("detection") or {}
+        volume = candidate.get("volume") or {}
+        arm_id = arm_by_target.get(target_id)
+        grasp = _dashboard_grasp_for_candidate(candidate, arm_id)
+        dashboard_targets.append(
+            {
+                "target_id": target_id,
+                "selected": target_id in selected_ids,
+                "primary": primary_target_id is not None and target_id == primary_target_id,
+                "arm_id": arm_id,
+                "class_name": detection.get("class_name"),
+                "confidence": _float_value(detection.get("score")),
+                "grasp_confidence": _float_value((grasp or {}).get("score")),
+                "target_selection_score": _float_value(candidate.get("target_score")),
+                "weight_kg": _float_value(candidate.get("predicted_weight_kg")),
+                "volume_liter": _float_value(volume.get("volume_liter")),
+                "center_base_m": _point_dict(candidate.get("center_base")),
+                "camera_depth_m": _float_or_none(candidate.get("camera_depth_m")),
+                "camera_distance_m": _float_or_none(candidate.get("camera_distance_m")),
+            }
+        )
+
+    dashboard_targets.sort(
+        key=lambda item: (
+            not bool(item.get("selected")),
+            item.get("camera_depth_m") if item.get("camera_depth_m") is not None else float("inf"),
+            item.get("target_id") if item.get("target_id") is not None else float("inf"),
+        )
+    )
+    for index, item in enumerate(dashboard_targets):
+        item["label"] = _watermelon_label(index)
+    target["dashboard_targets"] = dashboard_targets
+
+
+def _update_dashboard_frame_if_needed(
+    args: argparse.Namespace,
+    color_bgr,
+    depth_mm,
+    result: dict[str, Any],
+    debug: dict[str, Any],
+    intrinsic: dict[str, float],
+    dashboard_state: dict[str, float],
+) -> None:
+    now = time.monotonic()
+    interval = 1.0 / max(float(args.dashboard_fps), 0.1)
+    if now - float(dashboard_state.get("last_update_time", 0.0)) < interval:
+        return
+
+    dashboard_state["last_update_time"] = now
+    if args.dashboard_frame_mode == "rgb":
+        _update_dashboard_frame(color_bgr, args.dashboard_jpeg_quality)
+        return
+
+    try:
+        dashboard_image = draw_debug_overlay(color_bgr, result, debug, intrinsic, show_result_text=False)
+    except Exception as exc:
+        last_warn = float(dashboard_state.get("last_warn_time", 0.0))
+        if now - last_warn >= 2.0:
+            print(f"[WARN] Dashboard debug frame render failed: {exc}", flush=True)
+            dashboard_state["last_warn_time"] = now
+        dashboard_image = color_bgr
+    _update_dashboard_frame(dashboard_image, args.dashboard_jpeg_quality)
+
+
 def _update_dashboard_frame(color_bgr, jpeg_quality: int) -> None:
     quality = int(max(35, min(jpeg_quality, 95)))
     ok, encoded = cv2.imencode(".jpg", color_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
@@ -201,20 +297,64 @@ def _update_dashboard_frame(color_bgr, jpeg_quality: int) -> None:
         update_latest_frame_jpeg(encoded.tobytes(), time.time())
 
 
-def _dashboard_frame_loop(
-    stream: RGBDStreamWorker,
-    jpeg_quality: int,
-    dashboard_fps: float,
-    stop_event: Event,
-) -> None:
-    interval = 1.0 / max(float(dashboard_fps), 0.1)
-    last_sequence = 0
-    while not stop_event.is_set():
-        frame = stream.get_latest()
-        if frame is not None and frame.sequence != last_sequence:
-            last_sequence = frame.sequence
-            _update_dashboard_frame(frame.color_bgr, jpeg_quality)
-        stop_event.wait(interval)
+def _arm_by_target(assignments: dict[str, Any]) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for arm_id, assignment in assignments.items():
+        if not isinstance(assignment, dict) or not assignment.get("enabled", False):
+            continue
+        target_id = _safe_int(assignment.get("target_id"))
+        if target_id is not None:
+            result[target_id] = str(arm_id)
+    return result
+
+
+def _dashboard_grasp_for_candidate(candidate: dict[str, Any], arm_id: str | None) -> dict[str, Any] | None:
+    if arm_id:
+        arm_grasp = (candidate.get("arm_side_grasps") or {}).get(arm_id)
+        if isinstance(arm_grasp, dict):
+            return arm_grasp
+    visible_grasp = candidate.get("visible_grasp")
+    return visible_grasp if isinstance(visible_grasp, dict) else None
+
+
+def _point_dict(point: Any) -> dict[str, float] | None:
+    if point is None:
+        return None
+    try:
+        return {
+            "x": float(point[0]),
+            "y": float(point[1]),
+            "z": float(point[2]),
+        }
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _watermelon_label(index: int) -> str:
+    if 0 <= index < 26:
+        return f"西瓜{chr(ord('A') + index)}"
+    return f"西瓜{index + 1}"
 
 
 def _camera_status_result(args: argparse.Namespace, status: dict[str, Any]) -> dict[str, Any]:

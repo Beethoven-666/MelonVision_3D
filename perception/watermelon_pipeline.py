@@ -131,6 +131,8 @@ class WatermelonVisionProcessor:
                 "target_selection_score": float(best["target_score"]),
                 "target_selection": best["target_score_breakdown"],
                 "center_base_m": to_point3d(center_base),
+                "camera_depth_m": float(best["camera_depth_m"]),
+                "camera_distance_m": float(best["camera_distance_m"]),
                 "axes_m": pose["axes_length_m"],
                 "volume": volume,
                 "predicted_weight_kg": float(best["predicted_weight_kg"]),
@@ -211,6 +213,7 @@ class WatermelonVisionProcessor:
             }
 
         center_base = self.transform.point_camera_to_base(pose["center_camera"])
+        center_camera = np.asarray(pose["center_camera"], dtype=np.float64).reshape(3)
         pose_confidence = self._pose_confidence(points_camera.shape[0])
         return {
             "status": "ok",
@@ -221,6 +224,8 @@ class WatermelonVisionProcessor:
             "visible_grasp": grasp,
             "volume": volume,
             "center_base": center_base,
+            "camera_depth_m": float(center_camera[2]),
+            "camera_distance_m": float(np.linalg.norm(center_camera)),
             "pose_confidence": pose_confidence,
             "point_count": int(points_camera.shape[0]),
             "target_score": 0.0,
@@ -236,13 +241,24 @@ class WatermelonVisionProcessor:
             return
 
         heights = [float(item["center_base"][2]) for item in candidates]
+        depths = [float(item["camera_depth_m"]) for item in candidates]
+        closest_depth = min(depths)
+        depth_range = max(depths) - closest_depth
         same_height_mode = len(candidates) > 1 and max(heights) - min(heights) <= self.same_height_band_m
         for item in candidates:
+            camera_depth_m = float(item["camera_depth_m"])
+            if depth_range <= 1e-6:
+                depth_priority_score = 1.0
+            else:
+                depth_priority_score = float(np.clip(1.0 - (camera_depth_m - closest_depth) / depth_range, 0.0, 1.0))
             target_score, target_score_breakdown = self._target_selection_score(
                 detection=item["detection"],
                 grasp=item["visible_grasp"],
                 point_count=int(item["point_count"]),
                 center_base=item["center_base"],
+                camera_depth_m=camera_depth_m,
+                camera_distance_m=float(item["camera_distance_m"]),
+                depth_priority_score=depth_priority_score,
                 pose_confidence=float(item["pose_confidence"]),
                 same_height_mode=same_height_mode,
             )
@@ -255,6 +271,9 @@ class WatermelonVisionProcessor:
         grasp: dict[str, Any],
         point_count: int,
         center_base: np.ndarray,
+        camera_depth_m: float,
+        camera_distance_m: float,
+        depth_priority_score: float,
         pose_confidence: float,
         same_height_mode: bool,
     ) -> tuple[float, dict[str, float]]:
@@ -269,29 +288,35 @@ class WatermelonVisionProcessor:
 
         if same_height_mode:
             weights = {
-                "grasp": 0.42,
-                "detection": 0.16,
-                "pose": 0.10,
-                "point_count": 0.10,
-                "robot_distance": 0.22,
+                "depth": 0.70,
+                "grasp": 0.12,
+                "detection": 0.06,
+                "pose": 0.04,
+                "point_count": 0.04,
+                "robot_distance": 0.04,
             }
         else:
             weights = {
-                "grasp": 0.50,
-                "detection": 0.18,
-                "pose": 0.12,
-                "point_count": 0.10,
-                "robot_distance": 0.10,
+                "depth": 0.75,
+                "grasp": 0.10,
+                "detection": 0.05,
+                "pose": 0.04,
+                "point_count": 0.03,
+                "robot_distance": 0.03,
             }
 
         score = (
-            weights["grasp"] * grasp_score
+            weights["depth"] * depth_priority_score
+            + weights["grasp"] * grasp_score
             + weights["detection"] * detection_score
             + weights["pose"] * pose_confidence
             + weights["point_count"] * point_count_score
             + weights["robot_distance"] * robot_distance_score
         )
         return float(score), {
+            "depth_priority": float(depth_priority_score),
+            "camera_depth_m": float(camera_depth_m),
+            "camera_distance_m": float(camera_distance_m),
             "grasp": float(grasp_score),
             "detection": float(detection_score),
             "pose": float(pose_confidence),

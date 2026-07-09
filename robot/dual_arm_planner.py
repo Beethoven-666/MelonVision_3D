@@ -32,23 +32,29 @@ class DualArmInjectionPlanner:
         if not candidates:
             raise ValueError("No target candidates are available for dual-arm planning.")
 
-        enriched = [self._with_weight_and_side_grasps(candidate) for candidate in candidates]
-        heavy_candidates = [
+        enriched = sorted(
+            (self._with_weight_and_side_grasps(candidate) for candidate in candidates),
+            key=self._distance_priority_key,
+        )
+        nearest = enriched[0]
+        if nearest["predicted_weight_kg"] >= self._dual_arm_weight_threshold_kg():
+            return self._plan_two_arms_one_target(nearest)
+
+        light_candidates = [
             candidate
             for candidate in enriched
-            if candidate["predicted_weight_kg"] >= self._dual_arm_weight_threshold_kg()
+            if candidate["predicted_weight_kg"] < self._dual_arm_weight_threshold_kg()
         ]
-        if heavy_candidates:
-            best_heavy = max(heavy_candidates, key=self._heavy_score)
-            return self._plan_two_arms_one_target(best_heavy)
-
-        if len(enriched) >= 2:
-            pair_plan = self._plan_two_arms_two_targets(enriched)
+        if len(light_candidates) >= 2:
+            pair_plan = self._plan_two_arms_two_targets(
+                light_candidates,
+                anchor_target_id=int(nearest["target_id"]),
+            )
             if pair_plan is not None:
                 return pair_plan
 
-        best_single = max(enriched, key=lambda candidate: float(candidate["visible_grasp"].get("score", 0.0)))
-        return self._plan_single_arm(best_single)
+        reason = "nearest_light_target_no_feasible_pair" if len(light_candidates) >= 2 else "nearest_available_target"
+        return self._plan_single_arm(nearest, reason=reason)
 
     def _with_weight_and_side_grasps(self, candidate: dict[str, Any]) -> dict[str, Any]:
         volume_liter = float(candidate["volume"]["volume_liter"])
@@ -99,10 +105,17 @@ class DualArmInjectionPlanner:
             arm_grasps={"arm1": arm1, "arm2": arm2},
         )
 
-    def _plan_two_arms_two_targets(self, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _plan_two_arms_two_targets(
+        self,
+        candidates: list[dict[str, Any]],
+        anchor_target_id: int | None = None,
+    ) -> dict[str, Any] | None:
         best: dict[str, Any] | None = None
         for i, first in enumerate(candidates):
             for second in candidates[i + 1 :]:
+                if anchor_target_id is not None and not _pair_has_target(first, second, anchor_target_id):
+                    continue
+
                 pair_options = [
                     ("arm1", first, "arm2", second),
                     ("arm1", second, "arm2", first),
@@ -119,14 +132,21 @@ class DualArmInjectionPlanner:
                     if x_delta > self._x_shared_tolerance_mm():
                         continue
 
-                    score = (
+                    grasp_pair_score = (
                         float(grasp_a.get("score", 0.0))
                         + float(grasp_b.get("score", 0.0))
                         - x_delta / max(self._x_shared_tolerance_mm(), 1.0) * 0.2
                     )
-                    if best is None or score > best["score"]:
+                    pair_key = _pair_distance_priority_key(
+                        candidate_a,
+                        candidate_b,
+                        x_delta_mm=x_delta,
+                        grasp_pair_score=grasp_pair_score,
+                    )
+                    if best is None or pair_key < best["pair_key"]:
                         best = {
-                            "score": score,
+                            "pair_key": pair_key,
+                            "grasp_pair_score": grasp_pair_score,
                             "arm_a": arm_a,
                             "candidate_a": candidate_a,
                             "grasp_a": grasp_a,
@@ -139,6 +159,12 @@ class DualArmInjectionPlanner:
         if best is None:
             return None
 
+        selected_targets = sorted(
+            [best["candidate_a"], best["candidate_b"]],
+            key=self._distance_priority_key,
+        )
+        primary_target_id = int(selected_targets[0]["target_id"])
+        primary_arm_id = best["arm_a"] if int(best["candidate_a"]["target_id"]) == primary_target_id else best["arm_b"]
         arm_assignments = {
             best["arm_a"]: self._assignment_from_grasp(best["arm_a"], best["candidate_a"], best["grasp_a"]),
             best["arm_b"]: self._assignment_from_grasp(best["arm_b"], best["candidate_b"], best["grasp_b"]),
@@ -151,9 +177,13 @@ class DualArmInjectionPlanner:
         return self._plan_result(
             command=command,
             plan_type="dual_arm_two_light_watermelons",
-            selected_targets=[best["candidate_a"], best["candidate_b"]],
+            selected_targets=selected_targets,
             arm_grasps={best["arm_a"]: best["grasp_a"], best["arm_b"]: best["grasp_b"]},
-            extra={"x_delta_mm": float(best["x_delta_mm"])},
+            primary_arm_id=primary_arm_id,
+            extra={
+                "x_delta_mm": float(best["x_delta_mm"]),
+                "distance_priority": "camera_depth_m_nearest_first",
+            },
         )
 
     def _plan_single_arm(self, candidate: dict[str, Any], reason: str = "single_available_target") -> dict[str, Any]:
@@ -202,14 +232,19 @@ class DualArmInjectionPlanner:
         plan_type: str,
         selected_targets: list[dict[str, Any]],
         arm_grasps: dict[str, dict[str, Any] | None],
+        primary_arm_id: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        primary_target_id = int(selected_targets[0]["target_id"])
+        primary_arm_id = primary_arm_id or _arm_id_for_target(command, primary_target_id)
         target_summaries = [
             {
                 "target_id": int(candidate["target_id"]),
                 "predicted_weight_kg": float(candidate["predicted_weight_kg"]),
                 "volume_liter": float(candidate["volume"]["volume_liter"]),
                 "center_base_m": _point_dict(candidate["center_base"]),
+                "camera_depth_m": _candidate_depth_m(candidate),
+                "camera_distance_m": _candidate_distance_m(candidate),
             }
             for candidate in selected_targets
         ]
@@ -217,16 +252,19 @@ class DualArmInjectionPlanner:
         result = {
             "plan_type": plan_type,
             "robot_command": command,
+            "primary_target_id": primary_target_id,
+            "primary_arm_id": primary_arm_id,
             "selected_targets": target_summaries,
             "arm_grasps": {
                 arm_id: self._grasp_summary(arm_id, grasp, orientation_by_arm.get(arm_id))
                 for arm_id, grasp in arm_grasps.items()
             },
-            "primary_grasp": self._primary_grasp(arm_grasps, orientation_by_arm),
+            "primary_grasp": self._primary_grasp(arm_grasps, orientation_by_arm, primary_arm_id),
             "planning_config": {
                 "density_kg_per_liter": self._density_kg_per_liter(),
                 "dual_arm_weight_threshold_kg": self._dual_arm_weight_threshold_kg(),
                 "x_shared_tolerance_mm": self._x_shared_tolerance_mm(),
+                "distance_priority": "camera_depth_m_nearest_first",
             },
         }
         if extra:
@@ -268,8 +306,11 @@ class DualArmInjectionPlanner:
         self,
         arm_grasps: dict[str, dict[str, Any] | None],
         orientation_by_arm: dict[str, dict[str, Any]],
+        preferred_arm_id: str | None = None,
     ) -> dict[str, Any]:
-        for arm_id in ("arm1", "arm2"):
+        arm_order = [preferred_arm_id] if preferred_arm_id else []
+        arm_order.extend(arm_id for arm_id in ("arm1", "arm2") if arm_id not in arm_order)
+        for arm_id in arm_order:
             grasp = arm_grasps.get(arm_id)
             summary = self._grasp_summary(arm_id, grasp, orientation_by_arm.get(arm_id))
             if summary is not None:
@@ -300,8 +341,8 @@ class DualArmInjectionPlanner:
         return float(self.planning.get("single_target_two_arm_min_score", 0.30))
 
     @staticmethod
-    def _heavy_score(candidate: dict[str, Any]) -> float:
-        return float(candidate["predicted_weight_kg"]) + float(candidate["visible_grasp"].get("score", 0.0))
+    def _distance_priority_key(candidate: dict[str, Any]) -> tuple[float, int]:
+        return (_candidate_depth_m(candidate), int(candidate["target_id"]))
 
 
 def _unit_vector(vector: np.ndarray) -> np.ndarray:
@@ -309,6 +350,60 @@ def _unit_vector(vector: np.ndarray) -> np.ndarray:
     if norm <= 1e-9:
         return np.array([0.0, 1.0, 0.0], dtype=np.float64)
     return vector / norm
+
+
+def _candidate_depth_m(candidate: dict[str, Any]) -> float:
+    if "camera_depth_m" in candidate:
+        return float(candidate["camera_depth_m"])
+    pose = candidate.get("pose") or {}
+    if "center_camera" in pose:
+        center_camera = np.asarray(pose["center_camera"], dtype=np.float64).reshape(3)
+        return float(center_camera[2])
+    return float("inf")
+
+
+def _candidate_distance_m(candidate: dict[str, Any]) -> float:
+    if "camera_distance_m" in candidate:
+        return float(candidate["camera_distance_m"])
+    pose = candidate.get("pose") or {}
+    if "center_camera" in pose:
+        center_camera = np.asarray(pose["center_camera"], dtype=np.float64).reshape(3)
+        return float(np.linalg.norm(center_camera))
+    return float("inf")
+
+
+def _pair_has_target(first: dict[str, Any], second: dict[str, Any], target_id: int) -> bool:
+    return int(first["target_id"]) == target_id or int(second["target_id"]) == target_id
+
+
+def _pair_distance_priority_key(
+    candidate_a: dict[str, Any],
+    candidate_b: dict[str, Any],
+    x_delta_mm: float,
+    grasp_pair_score: float,
+) -> tuple[float, float, float, float]:
+    depth_a = _candidate_depth_m(candidate_a)
+    depth_b = _candidate_depth_m(candidate_b)
+    return (
+        max(depth_a, depth_b),
+        depth_a + depth_b,
+        float(x_delta_mm),
+        -float(grasp_pair_score),
+    )
+
+
+def _arm_id_for_target(command: dict[str, Any], target_id: int) -> str | None:
+    assignments = command.get("arm_assignments") or {}
+    for arm_id in ("arm1", "arm2"):
+        assignment = assignments.get(arm_id) or {}
+        assignment_target_id = assignment.get("target_id")
+        if assignment_target_id is not None and assignment.get("enabled", False) and int(assignment_target_id) == target_id:
+            return arm_id
+    for arm_id, assignment in assignments.items():
+        assignment_target_id = assignment.get("target_id")
+        if assignment_target_id is not None and assignment.get("enabled", False) and int(assignment_target_id) == target_id:
+            return str(arm_id)
+    return None
 
 
 def _point_dict(point_m: np.ndarray) -> dict[str, float]:
